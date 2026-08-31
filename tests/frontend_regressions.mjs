@@ -8,6 +8,18 @@ const { availableReferenceTags, createSessionId, fileCountFromDataTransfer, inse
 const responseSource = await readFile(new URL("../web/api/response.js", import.meta.url), "utf8");
 const responseEncoded = Buffer.from(responseSource).toString("base64");
 const { readApiResponse } = await import(`data:text/javascript;base64,${responseEncoded}`);
+const continuumSource = await readFile(new URL("../web/continuum.js", import.meta.url), "utf8");
+const continuumEncoded = Buffer.from(continuumSource).toString("base64");
+const {
+  applySequenceToContinuum,
+  chooseContinuumSampler,
+  connectedSequenceTextSource,
+  normalizeContinuumSettings,
+  parseContinuumPrompts,
+  sequenceStateFromResult,
+  serializeContinuumPrompts,
+  updateContinuumDraftFromEditor,
+} = await import(`data:text/javascript;base64,${continuumEncoded}`);
 const stateSource = await readFile(new URL("../web/studio_state.js", import.meta.url), "utf8");
 const stateEncoded = Buffer.from(stateSource).toString("base64");
 const {
@@ -65,6 +77,137 @@ function memoryStorage(initial = {}) {
     entries: () => Object.fromEntries(values),
   };
 }
+
+function continuumGraph({ samplerCount = 1, connected = true } = {}) {
+  const links = {};
+  const nodes = [];
+  for (let offset = 0; offset < samplerCount; offset += 1) {
+    const sampler = {
+      id: 100 + offset,
+      type: "H3ContinuumSamplerV34",
+      title: `Sampler ${offset + 1}`,
+      inputs: [{ name: "sequence_prompt", type: "STRING", link: connected && offset === 0 ? 10 : null }],
+      widgets: [
+        { name: "chunks", value: 3 },
+        { name: "chunk_seconds", value: 5 },
+      ],
+    };
+    nodes.push(sampler);
+  }
+  const textWidget = { name: "value", value: "old", callbackCalls: 0 };
+  textWidget.callback = () => { textWidget.callbackCalls += 1; };
+  const text = {
+    id: 1,
+    type: "PrimitiveStringMultiline",
+    inputs: [],
+    outputs: [{ name: "STRING", type: "STRING", links: [10] }],
+    widgets: [textWidget],
+    widgetChanges: [],
+    onWidgetChanged(...args) { this.widgetChanges.push(args); },
+  };
+  if (connected) {
+    nodes.push(text);
+    links[10] = { origin_id: 1, origin_slot: 0, target_id: 100, target_slot: 0 };
+  }
+  const graph = {
+    _nodes: nodes,
+    links,
+    dirtyCalls: 0,
+    changeCalls: 0,
+    getNodeById(id) { return this._nodes.find((node) => node.id === id); },
+    setDirtyCanvas() { this.dirtyCalls += 1; },
+    change() { this.changeCalls += 1; },
+  };
+  nodes.forEach((node) => { node.graph = graph; });
+  const canvas = { selected_nodes: {}, dirtyCalls: 0, setDirty() { this.dirtyCalls += 1; } };
+  return { app: { graph, canvas }, graph, samplers: nodes.filter((node) => node.type === "H3ContinuumSamplerV34"), text, textWidget };
+}
+
+test("Continuum canonical sections round-trip without changing chunk text", () => {
+  const prompts = ["First prompt.\nLine two.", "Second prompt.", "Third prompt."];
+  const serialized = serializeContinuumPrompts(prompts);
+  assert.equal(serialized, "[Chunk 1]\nFirst prompt.\nLine two.\n\n[Chunk 2]\nSecond prompt.\n\n[Chunk 3]\nThird prompt.");
+  assert.deepEqual(parseContinuumPrompts(serialized, 3), prompts);
+  assert.throws(() => parseContinuumPrompts("[Chunk 1]\nOne\n\n[Chunk 3]\nThree"), /expected \[Chunk 2\]/);
+  assert.deepEqual(normalizeContinuumSettings({ chunks: 16, chunk_seconds: 15 }), {
+    schema_version: 1,
+    chunks: 16,
+    chunk_seconds: 15,
+    total_seconds: 240,
+  });
+});
+
+test("Continuum structural drafts retain invalid manual text without discarding the last plan", () => {
+  const value = {
+    schema_version: 1,
+    settings: { chunks: 2, chunk_seconds: 5 },
+    plan: { schema_version: 1 },
+    prompts: ["One", "Two"],
+  };
+  const valid = updateContinuumDraftFromEditor(value, "[Chunk 1]\nChanged one\n\n[Chunk 2]\nTwo");
+  assert.deepEqual(valid.prompts, ["Changed one", "Two"]);
+  assert.equal(valid.raw_prompt, null);
+  const invalid = updateContinuumDraftFromEditor(valid, "[Chunk 1]\nChanged one");
+  assert.equal(invalid.raw_prompt, "[Chunk 1]\nChanged one");
+  assert.deepEqual(invalid.prompts, ["Changed one", "Two"]);
+});
+
+test("Continuum result state rejects canonical text that disagrees with structural chunks", () => {
+  const result = {
+    prompt: "[Chunk 1]\nOne\n\n[Chunk 2]\nTwo",
+    sequence: {
+      schema_version: 1,
+      settings: { chunks: 2, chunk_seconds: 5 },
+      plan: { schema_version: 1 },
+      chunks: [{ index: 1, prompt: "One" }, { index: 2, prompt: "Two" }],
+    },
+  };
+  assert.deepEqual(sequenceStateFromResult(result).prompts, ["One", "Two"]);
+  result.prompt = "[Chunk 1]\nOne\n\n[Chunk 2]\nChanged";
+  assert.throws(() => sequenceStateFromResult(result), /canonical text does not match/);
+});
+
+test("Continuum graph handoff uses stable sampler identity and updates a connected multiline widget", () => {
+  const { app, samplers, textWidget, graph } = continuumGraph();
+  const choice = chooseContinuumSampler(app);
+  assert.equal(choice.status, "selected");
+  assert.equal(choice.sampler, samplers[0]);
+  assert.equal(connectedSequenceTextSource(graph, samplers[0]).status, "connected");
+  const result = applySequenceToContinuum(app, samplers[0], {
+    settings: { chunks: 3, chunk_seconds: 5 },
+    prompts: ["One", "Two", "Three"],
+  });
+  assert.equal(result.status, "applied");
+  assert.equal(textWidget.value, "[Chunk 1]\nOne\n\n[Chunk 2]\nTwo\n\n[Chunk 3]\nThree");
+  assert.equal(textWidget.callbackCalls, 1);
+  assert.equal(graph.changeCalls, 1);
+});
+
+test("Continuum graph handoff never silently selects among multiple samplers", () => {
+  const { app, samplers } = continuumGraph({ samplerCount: 2, connected: false });
+  assert.equal(chooseContinuumSampler(app).status, "multiple");
+  app.canvas.selected_nodes = { [samplers[1].id]: samplers[1] };
+  assert.equal(chooseContinuumSampler(app).sampler, samplers[1]);
+});
+
+test("Continuum graph handoff reports setting mismatch and unconnected force-input separately", () => {
+  assert.equal(chooseContinuumSampler({ graph: { _nodes: [] } }).status, "missing");
+  assert.equal(chooseContinuumSampler({ graph: { _nodes: [{ type: "H3ContinuumSamplerV34", inputs: [], widgets: [] }] } }).status, "missing");
+  const { app, samplers } = continuumGraph({ connected: false });
+  let result = applySequenceToContinuum(app, samplers[0], {
+    settings: { chunks: 4, chunk_seconds: 6 },
+    prompts: ["One", "Two", "Three", "Four"],
+  });
+  assert.equal(result.status, "mismatch");
+  assert.deepEqual(result.mismatches.map((item) => item.field), ["chunks", "chunk_seconds"]);
+  result = applySequenceToContinuum(app, samplers[0], {
+    settings: { chunks: 4, chunk_seconds: 6 },
+    prompts: ["One", "Two", "Three", "Four"],
+  }, { syncSettings: true });
+  assert.equal(result.status, "unconnected");
+  assert.equal(samplers[0].widgets[0].value, 4);
+  assert.equal(samplers[0].widgets[1].value, 6);
+});
 
 test("API responses preserve structured server errors", async () => {
   const response = {
@@ -268,6 +411,9 @@ test("user preferences persist only stable non-secret settings", () => {
     directReasoningEffort: "medium",
     musicLyricsUseBrief: false,
     fullscreen: true,
+    generationTarget: "continuum",
+    continuumChunks: 8,
+    continuumChunkSeconds: 6.5,
     selectedModel: { id: "api::secret-connection::model", api_connection_id: "secret-connection" },
     apiProviderConfig: { api_key: "must-not-be-stored" },
     creativeBrief: "must-not-be-stored",
@@ -278,7 +424,7 @@ test("user preferences persist only stable non-secret settings", () => {
   const serialized = storage.entries()[USER_PREFERENCES_STORAGE_KEY];
   assert.doesNotMatch(serialized, /secret|creativeBrief|keepModelLoaded|thinking|connection/);
   assert.deepEqual(loadUserPreferences(storage), {
-    version: 1,
+    version: 2,
     mode: "Reference",
     duration_seconds: 14,
     aspect_ratio: "9:16",
@@ -292,12 +438,15 @@ test("user preferences persist only stable non-secret settings", () => {
     direct_reasoning_effort: "medium",
     music_lyrics_use_brief: false,
     fullscreen: true,
+    generation_target: "continuum",
+    continuum_chunks: 8,
+    continuum_chunk_seconds: 6.5,
   });
 });
 
 test("user preferences ignore corrupt or unknown versions and sanitize fields", () => {
   assert.equal(loadUserPreferences(memoryStorage({ [USER_PREFERENCES_STORAGE_KEY]: "{" })), null);
-  assert.equal(loadUserPreferences(memoryStorage({ [USER_PREFERENCES_STORAGE_KEY]: JSON.stringify({ version: 2 }) })), null);
+  assert.equal(loadUserPreferences(memoryStorage({ [USER_PREFERENCES_STORAGE_KEY]: JSON.stringify({ version: 3 }) })), null);
 
   const storage = memoryStorage({
     [USER_PREFERENCES_STORAGE_KEY]: JSON.stringify({
@@ -312,7 +461,7 @@ test("user preferences ignore corrupt or unknown versions and sanitize fields", 
     }),
   });
   assert.deepEqual(loadUserPreferences(storage), {
-    version: 1,
+    version: 2,
     mode: "Reference",
     duration_seconds: 10,
     aspect_ratio: "16:9",
@@ -326,6 +475,9 @@ test("user preferences ignore corrupt or unknown versions and sanitize fields", 
     direct_reasoning_effort: "auto",
     music_lyrics_use_brief: true,
     fullscreen: false,
+    generation_target: "single",
+    continuum_chunks: 3,
+    continuum_chunk_seconds: 5,
   });
 });
 
@@ -457,12 +609,12 @@ test("all mode drafts persist independently across reloads", () => {
     Reference: { brief: "Reference brief", prompt: "Reference prompt" },
   });
   assert.deepEqual(loadModeDrafts(storage), {
-    T2VA: { brief: "Text brief", prompt: "Text prompt" },
-    I2VA: { brief: "Image brief", prompt: "Image prompt" },
-    Reference: { brief: "Reference brief", prompt: "Reference prompt" },
+    T2VA: { brief: "Text brief", prompt: "Text prompt", single_prompt: "Text prompt", generation_target: "single", continuum: null },
+    I2VA: { brief: "Image brief", prompt: "Image prompt", single_prompt: "Image prompt", generation_target: "single", continuum: null },
+    Reference: { brief: "Reference brief", prompt: "Reference prompt", single_prompt: "Reference prompt", generation_target: "single", continuum: null },
   });
   assert.match(storage.entries()[MODE_DRAFTS_STORAGE_KEY], /Reference brief|Reference prompt/);
-  assert.deepEqual(createStudioState({ sessionId: "drafts", storage }).modeDrafts.T2VA, { brief: "Text brief", prompt: "Text prompt" });
+  assert.deepEqual(createStudioState({ sessionId: "drafts", storage }).modeDrafts.T2VA, { brief: "Text brief", prompt: "Text prompt", single_prompt: "Text prompt", generation_target: "single", continuum: null });
 });
 
 test("video drafts preserve the 8000 character brief while Music keeps 2000", () => {
@@ -661,6 +813,7 @@ test("Generate and Refine payloads are built from state rather than Settings DOM
   assert.deepEqual(buildGeneratePayload(state, { creativeBrief: "A quiet shot.", seed: 3407 }), {
     session_id: state.sessionId,
     mode: "Reference",
+    generation_target: "single",
     duration_seconds: 8,
     aspect_ratio: "3:2",
     creative_brief: "A quiet shot.",
@@ -679,6 +832,7 @@ test("Generate and Refine payloads are built from state rather than Settings DOM
   assert.deepEqual(buildRefinePayload(state, { currentPrompt: "Current", instruction: "Slower", creativeBrief: "Original brief", seed: 99 }), {
     session_id: state.sessionId,
     mode: "Reference",
+    generation_target: "single",
     duration_seconds: 8,
     aspect_ratio: "3:2",
     creative_brief: "Original brief",
@@ -738,6 +892,52 @@ test("Generate and Refine payloads are built from state rather than Settings DOM
   assert.equal(directPayload.reasoning_effort, "medium");
   state.thinking = false;
   assert.equal(Object.hasOwn(buildGeneratePayload(state, { creativeBrief: "Direct brief", seed: 2 }), "reasoning_effort"), false);
+});
+
+test("Continuum payloads and drafts preserve structural sequence state", () => {
+  const state = createStudioState({ sessionId: "continuum-session", storage: memoryStorage() });
+  state.mode = "T2VA";
+  state.generationTarget = "continuum";
+  state.continuumChunks = 2;
+  state.continuumChunkSeconds = 6.5;
+  state.continuumSequence = {
+    schema_version: 1,
+    settings: { schema_version: 1, chunks: 2, chunk_seconds: 6.5, total_seconds: 13 },
+    plan: { schema_version: 1, global: {}, chunks: [] },
+    prompts: ["Prompt one.", "Prompt two."],
+  };
+  selectModelState(state, { id: "direct.gguf", family: "gguf", capabilities: { audio: false } });
+  const generated = buildGeneratePayload(state, { creativeBrief: "Continue one shot.", seed: 11 });
+  assert.equal(generated.generation_target, "continuum");
+  assert.equal(generated.duration_seconds, 6.5);
+  assert.deepEqual(generated.continuum, { schema_version: 1, chunks: 2, chunk_seconds: 6.5 });
+
+  const refined = buildRefinePayload(state, {
+    currentPrompt: "[Chunk 1]\nPrompt one.\n\n[Chunk 2]\nPrompt two.",
+    instruction: "Slow the second chunk.",
+    creativeBrief: "Continue one shot.",
+    chunkIndex: 2,
+    seed: 12,
+  });
+  assert.equal(refined.continuum.chunk_index, 2);
+  assert.equal(refined.continuum.plan, state.continuumSequence.plan);
+
+  const storage = memoryStorage();
+  saveModeDrafts(storage, {
+    T2VA: {
+      brief: "Continue one shot.",
+      prompt: "",
+      single_prompt: "A prior single prompt.",
+      generation_target: "continuum",
+      continuum: state.continuumSequence,
+    },
+  });
+  assert.deepEqual(loadModeDrafts(storage).T2VA.continuum.prompts, ["Prompt one.", "Prompt two."]);
+  assert.equal(loadModeDrafts(storage).T2VA.generation_target, "continuum");
+  assert.doesNotMatch(storage.entries()[MODE_DRAFTS_STORAGE_KEY], /api_key|connection_id/);
+  assert.match(mainSource, /data-generation-target="continuum"/);
+  assert.match(mainSource, /data-apply-continuum/);
+  assert.match(mainSource, /Only the selected chunk changes/);
 });
 
 test("Ollama remote host controls stay collapsed and disclosure state survives refresh renders", () => {
@@ -981,6 +1181,9 @@ test("Music 3 drafts and payload keep lyrics separate from H3 state", () => {
     brief: "Oboe chamber pop",
     lyrics: "[Verse]\nWindows glow",
     prompt: "### Global Metadata\n...",
+    single_prompt: "### Global Metadata\n...",
+    generation_target: "single",
+    continuum: null,
   });
   const state = createStudioState({ sessionId: "music-session", storage });
   state.mode = "Music3";

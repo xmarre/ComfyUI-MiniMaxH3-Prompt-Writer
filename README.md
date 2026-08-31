@@ -43,6 +43,8 @@ Use <Picture 1> for character appearance, <Picture 2> for clothes, and only the 
 
 Writer sends your brief, selected mode, prepared references, and the official MiniMax prompt-writing guide to the chosen prompt model. The result is an editable H3 prompt. You can change it directly, use **Refine** for a revision, or select **Copy prompt** and paste it into your H3 workflow.
 
+For longer shots, choose **H3 Continuum** as the output target. Writer first plans continuity, then writes one complete H3 prompt per chunk in canonical `[Chunk N]` form for the [H3 Continuum](https://github.com/xmarre/ComfyUI-H3-Continuum) V3.4 sampler. This is a separate target, not another H3 mode; T2VA, I2VA, FL2VA, L2VA, and Reference keep their existing media semantics.
+
 ## Key features
 
 - T2VA, I2VA, FL2VA, L2VA, and Reference modes.
@@ -52,6 +54,7 @@ Writer sends your brief, selected mode, prepared references, and the official Mi
 - Ordered video contact sheets with visible frame-sampling controls, so you can inspect what the prompt model sees.
 - Official MiniMax base and Reference guides included for all five modes.
 - Editable prompts, **Refine**, **Copy prompt**, and a separate saved draft for every mode.
+- Native H3 Continuum sequences from 1 to 16 chunks at 4 to 15 seconds per chunk, with chunk-local refinement and an explicit **Apply to Continuum** handoff.
 - Automatic context planning and clear controls for releasing local prompt models and ComfyUI VRAM.
 
 See [Writing a useful Creative Brief](docs/USAGE.md#writing-a-useful-creative-brief) for practical examples.
@@ -79,6 +82,8 @@ Not sure? Start with [Ollama](docs/OLLAMA.md). The [provider guide](docs/PROVIDE
 
 4. Choose a mode, add its media, and write a Creative Brief.
 5. Select **Generate prompt**, review the editable result, then copy it into your H3 workflow.
+
+To write a longer sequence, select **H3 Continuum**, choose the chunk count and seconds per chunk, then select **Generate sequence**. See [H3 Continuum sequences](docs/USAGE.md#h3-continuum-sequences).
 
 For Git, ZIP, Windows Portable, update, and provider-specific steps, see [Installation](docs/INSTALLATION.md).
 

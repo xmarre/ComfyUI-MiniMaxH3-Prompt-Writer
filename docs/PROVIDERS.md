@@ -46,3 +46,11 @@ Choose an API provider if you do not want a local prompt-model runtime. Gemini, 
 Remote providers receive the brief, H3 instructions, and prepared visual inputs from the current mode's manifest. Read [API providers](API_PROVIDERS.md#what-leaves-this-computer) before connecting a remote service.
 
 Comfy Cloud has not been validated for v0.3.
+
+## H3 Continuum request budgeting
+
+A Continuum sequence is not one prompt-model call. Writer normally makes one planning call plus one call for every chunk. A structurally invalid plan gets at most one narrow repair call. Existing H3 format repair can add a correction call for an individual chunk when its first draft fails an objective check.
+
+For Direct, Ollama, and External llama.cpp, expect proportionally longer runtime. Writer keeps one admitted request and reuses the selected backend through the stages; **Cancel** stops the sequence at the next safe point. **Keep model loaded** still controls the final lifecycle decision for Writer-managed local providers.
+
+For a paid API provider, every provider call can consume quota and incur cost. The result reports the provider's cumulative request count, request IDs, and reported cost when the endpoint supplies them. Confirm current provider pricing and limits before generating a large sequence.

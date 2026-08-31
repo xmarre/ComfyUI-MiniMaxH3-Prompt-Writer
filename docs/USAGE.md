@@ -17,6 +17,26 @@ Use the fullscreen button in the Writer header when you want the workspace to fi
 
 ![Reference mode with a generated prompt](assets/v0.3/reference-workspace.png)
 
+## H3 Continuum sequences
+
+**H3 Continuum** is an output target for the five H3 Video modes. It is not a sixth mode. Choose the underlying T2VA, I2VA, FL2VA, L2VA, or Reference mode first, then select **H3 Continuum** under **Output target**.
+
+Set **Chunks** from 1 to 16 and **Seconds per chunk** from 4 to 15. Writer shows their total duration but sends the native per-chunk duration to H3. For example, 8 chunks at 6 seconds is a 48-second sequence.
+
+Sequence generation is staged:
+
+1. Writer creates and validates one compact continuity plan for the complete sequence.
+2. Writer generates each complete H3 prompt in order, giving the next chunk the saved plan and the previous chunk's prompt.
+3. Writer returns deterministic `[Chunk 1]`, `[Chunk 2]`, and later sections accepted by H3 Continuum.
+
+The plan keeps subject identity, wardrobe, environment, camera axis, lighting, sound, dialogue, visible text, constraints, and reference roles stable. A cut or other discontinuity is allowed only when the plan records it as intentional. Prompt models are probabilistic, so review the sequence; Writer validates structure and stable identifiers but cannot guarantee perfect visual continuity from the video model.
+
+Install [ComfyUI H3 Continuum](https://github.com/xmarre/ComfyUI-H3-Continuum) and use **H3 Continuum Sampler V3.4**. Connect a **Text (Multiline)** node to the sampler's **Sequence Prompt** input. **Apply to Continuum** writes the canonical sequence into that connected text widget. If more than one compatible sampler exists, select exactly one on the canvas first. If its chunk settings differ, Writer shows the mismatch and offers an explicit **Sync settings & apply** action. If the text input is missing or connected to a non-editable source, Writer copies the sequence and tells you where to paste it; it does not add or rewire nodes.
+
+For a local change, open **Refine**, select one chunk, and describe the revision. Writer regenerates only that chunk and preserves every other chunk byte-for-byte. H3 Continuum Run Storage hashes the raw prompt of each chunk, so applying such a result lets its partial-regeneration logic preserve the unchanged prefix up to the first changed chunk. Manual edits must keep contiguous, one-based `[Chunk N]` sections before refinement or graph handoff.
+
+The target, settings, validated plan, chunk prompts, and manual draft are saved with the current mode. API credentials are not part of that saved state.
+
 ## Modes
 
 | Mode | Input | How the media is used |
@@ -159,6 +179,8 @@ Writer saves stable preferences in the browser used to open ComfyUI:
 It never saves API keys. If a saved model no longer exists, discovery falls back without treating the missing model as a fatal error.
 
 Every H3 mode keeps its own Creative Brief and editable prompt draft across a page reload. Music 3 separately keeps its Music Brief, Lyrics, and edited caption. Uploaded media is session content and is not restored after reload.
+
+Continuum drafts additionally keep their generation target, chunk settings, validated continuity plan, and individual prompts. This structural state is used for chunk-local refinement; it contains no provider secret or API key.
 
 In **Settings > Prompt behavior**, select **Restore default drafts**. The button changes to **Click again to confirm** for five seconds. Select it again to delete every saved mode draft. The current mode immediately returns to its current built-in Creative Brief and prompt; the other modes use their current built-in defaults when opened. This includes Reference. Media, provider settings, custom system prompts, and API credentials are not changed.
 

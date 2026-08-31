@@ -235,6 +235,24 @@ For External llama.cpp, restart with the model's matching `--mmproj`. You can ke
 
 The selected model shows **Vision** and completes a real image request.
 
+## Continuum sequence or handoff failure
+
+**Symptom**
+
+Writer rejects a sequence plan, reports a failure at a specific chunk, cannot find a sampler, asks you to select one sampler, or says the Sequence Prompt source is not editable.
+
+**Cause**
+
+The prompt model returned invalid plan or chunk structure; the configured values are outside H3 Continuum's native 1–16 chunks and 4–15 seconds per chunk; or the workflow does not expose one unambiguous **H3 Continuum Sampler V3.4** connected to a **Text (Multiline)** source.
+
+**Fix**
+
+Review the reported chunk and clarify the Creative Brief. A malformed plan receives one automatic structural repair; a second invalid plan stops instead of being guessed. Keep manual output in contiguous `[Chunk N]` sections. Add or select exactly one compatible V3.4 sampler and connect an editable Text (Multiline) node to **Sequence Prompt**. When Writer and sampler settings differ, use **Sync settings & apply** only after reviewing the proposed values.
+
+**Verify**
+
+The complete canonical sequence appears in the connected text widget, sampler chunk values match Writer, and the workflow accepts the prompt without parser warnings.
+
 ## API authentication, rate limit, or truncated response
 
 **Symptom**

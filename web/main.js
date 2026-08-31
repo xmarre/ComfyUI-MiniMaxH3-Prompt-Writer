@@ -1,6 +1,19 @@
 import { app } from "/scripts/app.js";
 import { cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, resampleMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
 import { availableReferenceTags, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
+import {
+  applySequenceToContinuum,
+  chooseContinuumSampler,
+  CONTINUUM_MAX_CHUNKS,
+  CONTINUUM_MAX_SECONDS,
+  CONTINUUM_MIN_CHUNKS,
+  CONTINUUM_MIN_SECONDS,
+  continuumDraftOutput,
+  continuumSamplerLabel,
+  parseContinuumPrompts,
+  sequenceStateFromResult,
+  updateContinuumDraftFromEditor,
+} from "./continuum.js";
 import { generateModelSummaryMarkup, settingsMarkup } from "./settings.js";
 import {
   buildGeneratePayload,
@@ -830,10 +843,32 @@ function defaultModeDraft(mode) {
 }
 
 function currentDraftFields() {
-  return {
+  const output = studio.root.querySelector("[data-output]").value;
+  const existing = studio.modeDrafts[studio.mode] || {};
+  const base = {
     brief: currentBriefTextarea().value,
     lyrics: studio.mode === "Music3" ? studio.root.querySelector("[data-music-lyrics]").value : "",
-    prompt: studio.root.querySelector("[data-output]").value,
+  };
+  if (studio.mode === "Music3") return { ...base, prompt: output };
+  if (studio.generationTarget === "continuum") {
+    const continuum = studio.continuumSequence?.plan
+      ? updateContinuumDraftFromEditor(studio.continuumSequence, output)
+      : studio.continuumSequence;
+    studio.continuumSequence = continuum;
+    return {
+      ...base,
+      prompt: "",
+      single_prompt: existing.single_prompt || existing.prompt || defaultModeDraft(studio.mode).prompt,
+      generation_target: "continuum",
+      continuum,
+    };
+  }
+  return {
+    ...base,
+    prompt: output,
+    single_prompt: output,
+    generation_target: "single",
+    continuum: studio.continuumSequence || existing.continuum || null,
   };
 }
 
@@ -879,9 +914,19 @@ function restoreModeDraft(mode) {
   const output = studio.root.querySelector("[data-output]");
   currentBriefTextarea().value = draft.brief;
   if (mode === "Music3") studio.root.querySelector("[data-music-lyrics]").value = draft.lyrics || "";
-  output.value = draft.prompt;
-  studio.lastModelPrompt = draft.prompt;
-  studio.lastModelMeta = promptLengthMeta(draft.prompt);
+  const savedTarget = mode === "Music3" ? "single" : draft.generation_target || studio.generationTarget || "single";
+  studio.generationTarget = savedTarget;
+  studio.continuumSequence = mode === "Music3" ? null : draft.continuum || null;
+  if (studio.continuumSequence?.settings) {
+    studio.continuumChunks = studio.continuumSequence.settings.chunks;
+    studio.continuumChunkSeconds = studio.continuumSequence.settings.chunk_seconds;
+  }
+  const prompt = savedTarget === "continuum"
+    ? studio.continuumSequence ? continuumDraftOutput(studio.continuumSequence) : ""
+    : draft.single_prompt || draft.prompt;
+  output.value = prompt;
+  studio.lastModelPrompt = prompt;
+  studio.lastModelMeta = promptLengthMeta(prompt);
   studio.refineRestore = null;
   studio.root.querySelector("[data-refine-restore]").hidden = true;
   studio.lyricsRestore = null;
@@ -889,8 +934,139 @@ function restoreModeDraft(mode) {
   studio.root.querySelector(".h3ps-editor-meta span:last-child").textContent = promptLengthMeta(output.value);
   updateBriefLayout();
   updateMusicLyricsCount();
+  syncGenerationTarget();
   renderPromptHighlights();
   syncModifiedState();
+}
+
+function syncContinuumChunkSelector() {
+  if (!studio?.root) return;
+  const field = studio.root.querySelector("[data-refine-chunk-field]");
+  const select = studio.root.querySelector("[data-refine-chunk]");
+  const active = studio.mode !== "Music3" && studio.generationTarget === "continuum";
+  field.hidden = !active;
+  if (!active) return;
+  const previous = Number(select.value) || 1;
+  select.innerHTML = Array.from({ length: studio.continuumChunks }, (_, offset) => (
+    `<option value="${offset + 1}">Chunk ${offset + 1}</option>`
+  )).join("");
+  select.value = String(Math.min(previous, studio.continuumChunks));
+}
+
+function syncGenerationTarget() {
+  if (!studio?.root) return;
+  const active = studio.mode !== "Music3" && studio.generationTarget === "continuum";
+  studio.root.querySelectorAll("[data-generation-target]").forEach((button) => {
+    const selected = button.dataset.generationTarget === (active ? "continuum" : "single");
+    button.classList.toggle("is-active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+    button.disabled = studio.requestBusy;
+  });
+  studio.root.querySelector("[data-generation-target-control]").hidden = studio.mode === "Music3";
+  studio.root.querySelector("[data-single-duration-field]").hidden = active;
+  studio.root.querySelector("[data-continuum-settings]").hidden = !active;
+  studio.root.querySelector("[data-continuum-chunks]").value = String(studio.continuumChunks);
+  studio.root.querySelector("[data-continuum-seconds]").value = String(studio.continuumChunkSeconds);
+  studio.root.querySelector("[data-continuum-total]").textContent = `${(studio.continuumChunks * studio.continuumChunkSeconds).toFixed(1).replace(/\.0$/, "")} seconds total`;
+  const badge = studio.root.querySelector("[data-continuum-output-badge]");
+  badge.hidden = !active;
+  badge.textContent = active ? `${studio.continuumChunks} chunks · ${Number(studio.continuumChunkSeconds).toLocaleString()}s each` : "";
+  studio.root.querySelector("[data-output-label]").textContent = studio.mode === "Music3" ? "Generated caption" : active ? "Continuum sequence" : "Generated prompt";
+  studio.root.querySelector("[data-copy-label]").textContent = studio.mode === "Music3" ? "Copy caption" : active ? "Copy sequence" : "Copy prompt";
+  const generateLabel = studio.root.querySelector("[data-generate-label]");
+  if (generateLabel && !studio.requestBusy) generateLabel.textContent = studio.mode === "Music3" ? "Generate caption" : active ? "Generate sequence" : "Generate prompt";
+  studio.root.querySelector("[data-apply-continuum]").hidden = !active;
+  studio.root.querySelector("[data-apply-continuum]").disabled = studio.requestBusy || !studio.continuumSequence?.plan;
+  studio.root.querySelector("[data-refine-title]").textContent = active ? "Refine one chunk" : studio.mode === "Music3" ? "Refine caption" : "Refine prompt";
+  studio.root.querySelector("[data-refine-helper]").textContent = active ? "Only the selected chunk changes" : studio.mode === "Music3" ? "Describe the musical change" : "Describe only what should change";
+  syncContinuumChunkSelector();
+}
+
+function setGenerationTarget(target) {
+  if (studio.mode === "Music3" || !["single", "continuum"].includes(target) || target === studio.generationTarget) return;
+  saveCurrentModeDraft();
+  studio.generationTarget = target;
+  const draft = studio.modeDrafts[studio.mode] || {};
+  const output = studio.root.querySelector("[data-output]");
+  if (target === "continuum") {
+    studio.continuumSequence = draft.continuum || studio.continuumSequence;
+    if (studio.continuumSequence?.settings) {
+      studio.continuumChunks = studio.continuumSequence.settings.chunks;
+      studio.continuumChunkSeconds = studio.continuumSequence.settings.chunk_seconds;
+      output.value = continuumDraftOutput(studio.continuumSequence);
+    } else {
+      output.value = "";
+    }
+  } else {
+    output.value = draft.single_prompt || draft.prompt || defaultModeDraft(studio.mode).prompt;
+  }
+  studio.lastModelPrompt = output.value;
+  studio.lastModelMeta = promptLengthMeta(output.value);
+  studio.root.querySelector(".h3ps-editor-meta span:last-child").textContent = studio.lastModelMeta;
+  syncGenerationTarget();
+  renderPromptHighlights();
+  syncModifiedState();
+  saveCurrentModeDraft();
+  saveUserPreferences(localStorage, studio);
+}
+
+async function applyCurrentSequence(syncSettings = false) {
+  if (!studio.continuumSequence?.plan) {
+    showToast("No Continuum sequence", "Generate a valid H3 Continuum sequence first.");
+    return;
+  }
+  studio.continuumSequence = updateContinuumDraftFromEditor(
+    studio.continuumSequence,
+    studio.root.querySelector("[data-output]").value,
+  );
+  if (studio.continuumSequence.raw_prompt != null) {
+    showToast("Sequence syntax is invalid", "Restore contiguous [Chunk N] sections before applying the sequence.");
+    return;
+  }
+  const choice = chooseContinuumSampler(app);
+  if (choice.status === "missing") {
+    showToast("Continuum sampler not found", "Add H3 Continuum Sampler V3.4 to the current workflow.");
+    return;
+  }
+  if (choice.status === "multiple") {
+    showToast("Select a Continuum sampler", "Multiple compatible samplers are present. Select exactly one H3 Continuum Sampler V3.4 on the canvas, then apply again.");
+    return;
+  }
+  const result = applySequenceToContinuum(app, choice.sampler, studio.continuumSequence, { syncSettings });
+  if (result.status === "mismatch") {
+    const detail = result.mismatches.map((item) => `${item.field === "chunks" ? "Chunks" : "Chunk seconds"}: Writer ${item.writer}, sampler ${item.sampler}`).join(" · ");
+    showToast(
+      "Continuum settings differ",
+      detail,
+      null,
+      { label: "Sync settings & apply", onClick: () => applyCurrentSequence(true) },
+      { dismissOnWorkspaceClick: true },
+    );
+    return;
+  }
+  if (result.status === "unconnected" || result.status === "incompatible_source") {
+    try {
+      await navigator.clipboard.writeText(result.prompt);
+      showToast(
+        "Sequence copied",
+        result.status === "unconnected"
+          ? "Connect a Text (Multiline) node to Sequence Prompt, then paste the copied sequence into it."
+          : "Sequence Prompt is connected to a non-editable source. Connect a Text (Multiline) node and paste the copied sequence into it.",
+        null,
+        null,
+        { dismissOnWorkspaceClick: true },
+      );
+    } catch (error) {
+      showToast("Continuum handoff needs a text node", "Connect a Text (Multiline) node to Sequence Prompt and copy the sequence manually.", error.message);
+    }
+    return;
+  }
+  if (result.status !== "applied") {
+    showToast("Continuum handoff failed", "The selected node does not expose the required V3.4 sequence inputs.");
+    return;
+  }
+  saveCurrentModeDraft();
+  showToast("Sequence applied", `${continuumSamplerLabel(choice.sampler)} now has the canonical ${studio.continuumChunks}-chunk prompt sequence.`);
 }
 
 function syncWorkspace() {
@@ -925,6 +1101,7 @@ function syncWorkspace() {
     setMusicSystemPromptExpanded(false);
   }
   syncModeAvailability();
+  syncGenerationTarget();
 }
 
 function syncModeAvailability() {
@@ -1037,6 +1214,7 @@ function setGenerationState(state, label, detail) {
   } else {
     studio.generationDotCount = 0;
   }
+  syncGenerationTarget();
 }
 
 function updatePromptResidency(status) {
@@ -1191,12 +1369,18 @@ async function startGenerationPreview() {
   studio.activeRequestFamily = studio.selectedModel.family;
   studio.activeRequestModelId = studio.selectedModel.family === "ollama" ? studio.selectedModel.remote_model : studio.selectedModel.id;
   const generationDetail = external ? `${modelName} · the server may load its model if idle` : apiProvider ? `${modelName} · ${studio.selectedModel.api_preset}` : modelName;
-  setGenerationState("busy", remote ? "Contacting provider" : "Loading model", generationDetail);
+  const continuumRequest = studio.mode !== "Music3" && studio.generationTarget === "continuum";
+  setGenerationState("busy", continuumRequest ? "Planning sequence" : remote ? "Contacting provider" : "Loading model", generationDetail);
   studio.statusTimer = setInterval(async () => {
     try {
       const status = await getStatus(studio.ollamaHost);
-      const labels = { loading_model: remote ? "Contacting provider" : "Loading model", processing_media: "Processing references", generating: "Generating", cancelling: "Cancelling" };
-      if (labels[status.phase]) setGenerationState("busy", labels[status.phase], generationDetail);
+      const labels = { loading_model: remote ? "Contacting provider" : "Loading model", processing_media: "Processing references", planning_sequence: "Planning sequence", generating_chunk: "Generating chunk", generating: "Generating", cancelling: "Cancelling" };
+      if (labels[status.phase]) {
+        const sequenceDetail = status.phase === "generating_chunk" && status.sequence_chunk_index
+          ? `Chunk ${status.sequence_chunk_index} of ${status.sequence_chunk_total} · ${generationDetail}`
+          : generationDetail;
+        setGenerationState("busy", labels[status.phase], sequenceDetail);
+      }
     } catch {}
   }, 650);
   try {
@@ -1206,6 +1390,11 @@ async function startGenerationPreview() {
       seed: newGenerationSeed(),
     }));
     const output = studio.root.querySelector("[data-output]");
+    if (continuumRequest) {
+      studio.continuumSequence = sequenceStateFromResult(result);
+      studio.continuumChunks = studio.continuumSequence.settings.chunks;
+      studio.continuumChunkSeconds = studio.continuumSequence.settings.chunk_seconds;
+    }
     output.value = result.prompt;
     studio.lastModelPrompt = result.prompt;
     renderPromptHighlights();
@@ -1216,7 +1405,14 @@ async function startGenerationPreview() {
     saveCurrentModeDraft();
     studio.refineRestore = null;
     studio.root.querySelector("[data-refine-restore]").hidden = true;
-    if (result.thinking_fallback) {
+    syncGenerationTarget();
+    if (continuumRequest && result.planner_repair_attempted) {
+      showToast("Sequence generated", `The sequence plan needed one structural repair before ${studio.continuumChunks} chunks were written.`, null, null, { dismissOnWorkspaceClick: true });
+    } else if (continuumRequest) {
+      const providerRequests = result.provider_request_count ?? result.sequence_request_count ?? studio.continuumChunks + 1;
+      const requestCount = result.api_provider ? ` · ${providerRequests} API requests` : "";
+      showToast("Sequence generated", `${studio.continuumChunks} chunks · ${result.total_seconds.toFixed(1)}s${requestCount}`);
+    } else if (result.thinking_fallback) {
       showToast("Prompt completed", thinkingFallbackMessage(result, "final prompt"), null, null, { dismissOnWorkspaceClick: true });
     } else if (result.format_repair_applied) {
       const repairDetail = result.format_repair_multimodal
@@ -2525,6 +2721,20 @@ async function submitRefinement() {
     showToast("Add a revision note", "Tell the model what should change in the current prompt.");
     return;
   }
+  const continuumRefinement = studio.mode !== "Music3" && studio.generationTarget === "continuum";
+  if (continuumRefinement) {
+    if (!studio.continuumSequence?.plan) {
+      showToast("No sequence plan", "Generate a Continuum sequence before refining one of its chunks.");
+      return;
+    }
+    try {
+      const prompts = parseContinuumPrompts(output.value, studio.continuumChunks);
+      studio.continuumSequence = { ...studio.continuumSequence, prompts, raw_prompt: null };
+    } catch (error) {
+      showToast("Sequence syntax is invalid", error.message);
+      return;
+    }
+  }
   if (!studio.selectedModel) {
     showToast("No prompt model selected", "Choose a local model, connect llama.cpp, or configure an API provider.");
     return;
@@ -2537,12 +2747,14 @@ async function submitRefinement() {
   if (!await inspectDirectRuntime()) return;
 
   const previousPrompt = output.value;
+  const previousContinuumSequence = studio.continuumSequence;
   const previousMeta = studio.root.querySelector(".h3ps-editor-meta span:last-child").textContent;
   studio.activeRequestFamily = studio.selectedModel.family;
   studio.activeRequestModelId = studio.selectedModel.family === "ollama" ? studio.selectedModel.remote_model : studio.selectedModel.id;
   submit.disabled = true;
   submit.innerHTML = `<span class="h3ps-spinner"></span>Refining…`;
-  setGenerationState("busy", "Refining prompt", studio.selectedModel.name.split("/").pop());
+  const selectedChunk = continuumRefinement ? Number(panel.querySelector("[data-refine-chunk]").value) : null;
+  setGenerationState("busy", continuumRefinement ? `Refining Chunk ${selectedChunk}` : "Refining prompt", studio.selectedModel.name.split("/").pop());
   try {
     const result = await refine(buildRefinePayload(studio, {
       currentPrompt: previousPrompt,
@@ -2550,13 +2762,16 @@ async function submitRefinement() {
       creativeBrief: currentBriefTextarea().value.trim(),
       lyrics: studio.mode === "Music3" ? studio.root.querySelector("[data-music-lyrics]").value : "",
       seed: newGenerationSeed(),
+      chunkIndex: selectedChunk,
     }));
     studio.refineRestore = {
       prompt: previousPrompt,
       meta: previousMeta,
       lastModelPrompt: studio.lastModelPrompt,
       lastModelMeta: studio.lastModelMeta,
+      continuumSequence: previousContinuumSequence,
     };
+    if (continuumRefinement) studio.continuumSequence = sequenceStateFromResult(result);
     output.value = result.prompt;
     studio.lastModelPrompt = result.prompt;
     renderPromptHighlights();
@@ -2569,7 +2784,9 @@ async function submitRefinement() {
     saveCurrentModeDraft();
     showToast(
       result.thinking_fallback ? "Rewrite completed" : "Prompt rewritten",
-      result.thinking_fallback
+      continuumRefinement
+        ? `Chunk ${selectedChunk} was rewritten; all other chunks were preserved byte-for-byte.`
+        : result.thinking_fallback
         ? thinkingFallbackMessage(result, "rewrite")
         : result.format_repair_applied
           ? result.format_repair_multimodal
@@ -2665,7 +2882,7 @@ function createStudio() {
         </nav>
         <div class="h3ps-output-toolbar">
           <span data-output-label>Generated prompt</span>
-          <div class="h3ps-output-badges"><button type="button" data-undo-edits hidden>Undo</button></div>
+          <div class="h3ps-output-badges"><span class="h3ps-continuum-badge" data-continuum-output-badge hidden></span><button type="button" data-undo-edits hidden>Undo</button></div>
         </div>
       </div>
 
@@ -2679,8 +2896,22 @@ function createStudio() {
           <p class="h3ps-section-hint" data-h3ps-mode-hint></p>
           <div class="h3ps-media" data-h3ps-media></div>
 
+          <div class="h3ps-generation-target" data-generation-target-control>
+            <span>Output target</span>
+            <div role="group" aria-label="Output target">
+              <button type="button" data-generation-target="single" aria-pressed="true">Single clip</button>
+              <button type="button" data-generation-target="continuum" aria-pressed="false">H3 Continuum</button>
+            </div>
+          </div>
+
+          <div class="h3ps-continuum-settings" data-continuum-settings hidden>
+            <label class="h3ps-field"><span>Chunks</span><input type="number" min="${CONTINUUM_MIN_CHUNKS}" max="${CONTINUUM_MAX_CHUNKS}" step="1" value="3" data-continuum-chunks></label>
+            <label class="h3ps-field"><span>Seconds per chunk</span><input type="number" min="${CONTINUUM_MIN_SECONDS}" max="${CONTINUUM_MAX_SECONDS}" step="0.5" value="5" data-continuum-seconds></label>
+            <strong data-continuum-total>15 seconds total</strong>
+          </div>
+
           <div class="h3ps-control-grid">
-            <label class="h3ps-field h3ps-duration-field"><span>Duration <b data-duration-label>10 seconds</b></span><div><input type="range" min="1" max="20" step="1" value="10" style="--h3ps-range:47.37%" data-duration-slider><i></i></div></label>
+            <label class="h3ps-field h3ps-duration-field" data-single-duration-field><span>Duration <b data-duration-label>10 seconds</b></span><div><input type="range" min="1" max="20" step="1" value="10" style="--h3ps-range:47.37%" data-duration-slider><i></i></div></label>
             <label class="h3ps-field h3ps-choice"><span>Aspect ratio</span><button type="button" data-choice-toggle="aspect"><b data-aspect-label>16:9</b><em data-aspect-description>Widescreen</em>${icon("chevron", 13)}</button><div class="h3ps-choice-menu h3ps-aspect-menu" data-choice-menu="aspect" hidden>${ASPECT_RATIOS.map(([value, label]) => `<button type="button" data-aspect="${value}"><b>${value}</b><em>${label}</em></button>`).join("")}</div></label>
           </div>
 
@@ -2756,6 +2987,7 @@ function createStudio() {
             <div class="h3ps-refine-heading">
               <span><strong data-refine-title>Refine prompt</strong><small><span data-refine-helper>Describe only what should change</span><em data-refine-media-note>No media re-upload</em></small></span>
               <div class="h3ps-refine-heading-actions">
+                <label class="h3ps-refine-chunk" data-refine-chunk-field hidden><span>Chunk</span><select data-refine-chunk></select></label>
                 <button type="button" class="h3ps-text-button" data-refine-restore hidden>Restore original</button>
                 <button type="button" class="h3ps-text-button" data-refine-cancel>Cancel</button>
                 <button type="button" class="h3ps-refine-submit" data-refine-submit>${icon("spark", 13)} Refine</button>
@@ -2766,6 +2998,7 @@ function createStudio() {
           <div class="h3ps-output-actions">
             <span class="h3ps-output-primary-actions">
               <button class="h3ps-secondary-button" type="button" title="Refine with local LLM" data-refine-toggle>${icon("spark", 15)} Refine</button>
+              <button class="h3ps-secondary-button" type="button" data-apply-continuum hidden>${icon("check", 15)} Apply to Continuum</button>
               <span class="h3ps-reference-insert" data-reference-insert hidden>
                 <button class="h3ps-reference-insert-toggle" type="button" title="Insert reference" aria-label="Insert reference" aria-haspopup="menu" aria-expanded="false" data-reference-insert-toggle></button>
                 <span class="h3ps-reference-insert-popover" data-reference-insert-popover role="menu" hidden></span>
@@ -2891,6 +3124,38 @@ function createStudio() {
     }
   });
   root.querySelector("[data-generate]").addEventListener("click", startGenerationPreview);
+  root.querySelectorAll("[data-generation-target]").forEach((button) => button.addEventListener("click", () => {
+    setGenerationTarget(button.dataset.generationTarget);
+  }));
+  const updateContinuumSettings = () => {
+    const chunksInput = root.querySelector("[data-continuum-chunks]");
+    const secondsInput = root.querySelector("[data-continuum-seconds]");
+    const chunks = Number(chunksInput.value);
+    const seconds = Number(secondsInput.value);
+    if (!Number.isInteger(chunks) || chunks < CONTINUUM_MIN_CHUNKS || chunks > CONTINUUM_MAX_CHUNKS || !Number.isFinite(seconds) || seconds < CONTINUUM_MIN_SECONDS || seconds > CONTINUUM_MAX_SECONDS) {
+      showToast("Invalid Continuum settings", `Use ${CONTINUUM_MIN_CHUNKS}–${CONTINUUM_MAX_CHUNKS} chunks and ${CONTINUUM_MIN_SECONDS}–${CONTINUUM_MAX_SECONDS} seconds per chunk.`);
+      syncGenerationTarget();
+      return;
+    }
+    const invalidatesSequence = studio.continuumSequence?.plan
+      && (studio.continuumSequence.settings.chunks !== chunks
+        || Math.abs(studio.continuumSequence.settings.chunk_seconds - seconds) > 1e-6);
+    studio.continuumChunks = chunks;
+    studio.continuumChunkSeconds = seconds;
+    if (invalidatesSequence) {
+      studio.continuumSequence = null;
+      root.querySelector("[data-output]").value = "";
+      studio.lastModelPrompt = "";
+      studio.lastModelMeta = promptLengthMeta("");
+      root.querySelector(".h3ps-editor-meta span:last-child").textContent = studio.lastModelMeta;
+      showToast("Sequence settings changed", "Generate a new sequence for the updated chunk settings.");
+    }
+    syncGenerationTarget();
+    saveCurrentModeDraft();
+    saveUserPreferences(localStorage, studio);
+  };
+  root.querySelector("[data-continuum-chunks]").addEventListener("change", updateContinuumSettings);
+  root.querySelector("[data-continuum-seconds]").addEventListener("change", updateContinuumSettings);
   root.querySelector("[data-restore-default-drafts]").addEventListener("click", restoreDefaultDrafts);
   root.querySelector("[data-comfy-memory-action]").addEventListener("click", () => releaseComfyVram());
   root.querySelector("[data-guide-toggle]").addEventListener("click", async () => {
@@ -3150,6 +3415,7 @@ function createStudio() {
     if (!root.querySelector("[data-other-models-popover]").hidden) positionOtherModelsPopover();
   });
   root.querySelector("[data-refine-toggle]").addEventListener("click", () => toggleRefine(root.querySelector("[data-refine-panel]").hidden));
+  root.querySelector("[data-apply-continuum]").addEventListener("click", () => applyCurrentSequence());
   root.querySelector("[data-refine-cancel]").addEventListener("click", () => toggleRefine(false));
   root.querySelector("[data-refine-submit]").addEventListener("click", submitRefinement);
   root.querySelector("[data-lyrics-refine-toggle]").addEventListener("click", () => {
@@ -3182,6 +3448,7 @@ function createStudio() {
     if (studio.refineRestore == null) return;
     const output = root.querySelector("[data-output]");
     output.value = studio.refineRestore.prompt;
+    studio.continuumSequence = studio.refineRestore.continuumSequence || studio.continuumSequence;
     studio.lastModelPrompt = studio.refineRestore.lastModelPrompt;
     studio.lastModelMeta = studio.refineRestore.lastModelMeta;
     renderPromptHighlights();
@@ -3189,6 +3456,7 @@ function createStudio() {
     studio.refineRestore = null;
     root.querySelector("[data-refine-restore]").hidden = true;
     syncModifiedState();
+    syncGenerationTarget();
     saveCurrentModeDraft();
     showToast("Previous prompt restored", "The AI rewrite was discarded.");
   });
@@ -3205,7 +3473,8 @@ function createStudio() {
   root.querySelector("[data-copy]").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(root.querySelector("[data-output]").value);
-      showToast(studio.mode === "Music3" ? "Caption copied" : "Prompt copied", studio.mode === "Music3" ? "The generated Music 3 caption is on your clipboard." : "The generated H3 prompt is on your clipboard.");
+      const continuum = studio.mode !== "Music3" && studio.generationTarget === "continuum";
+      showToast(studio.mode === "Music3" ? "Caption copied" : continuum ? "Sequence copied" : "Prompt copied", studio.mode === "Music3" ? "The generated Music 3 caption is on your clipboard." : continuum ? "The canonical [Chunk N] sequence is on your clipboard." : "The generated H3 prompt is on your clipboard.");
     } catch (error) {
       showToast("Copy failed", "Clipboard access was denied.", error.message);
     }

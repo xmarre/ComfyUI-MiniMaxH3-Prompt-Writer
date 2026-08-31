@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Added H3 Continuum as a separate video output target with native 1–16 chunk and 4–15 second controls.
+- Added validated continuity planning followed by sequential complete H3 prompt generation in canonical `[Chunk N]` form.
+- Added chunk-local refinement that preserves every unchanged chunk byte-for-byte.
+- Added an explicit graph handoff for H3 Continuum Sampler V3.4 with unambiguous sampler selection, settings mismatch review, connected Text (Multiline) updates, and clipboard fallback.
+
+### Reliability
+
+- Added deterministic structural sequence persistence without storing provider secrets.
+- Added sequence progress, cancellation, exact chunk-failure reporting, bounded one-shot plan repair, final-stage unload behavior, and cumulative provider accounting.
+
 ## 0.4.3 - 2026-08-29
 
 ### Features
