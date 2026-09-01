@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import threading
 import time
@@ -32,7 +33,16 @@ from .continuum import (
 )
 from .devlog import DEVELOPER_MODE, LOG_PATH, PeakVRAMMonitor, gpu_memory_snapshot, write_event
 from .guides import MODE_GUIDES, guide_catalog, guide_for_mode
-from .media import CACHE_ROOT, MAX_FILE_BYTES, MODE_LIMITS, STORE, MediaError, parse_session_id
+from .media import (
+    CACHE_ROOT,
+    MAX_FILE_BYTES,
+    MODE_LIMITS,
+    STORE,
+    MediaError,
+    materialize_workflow_image,
+    normalize_workflow_materialization_plan,
+    parse_session_id,
+)
 from .memory import assess_free_vram
 from .models.gguf_backend import BACKEND as GGUF_BACKEND
 from .models.external_server_backend import BACKEND as EXTERNAL_SERVER_BACKEND
@@ -1356,6 +1366,142 @@ async def refine(request: web.Request) -> web.Response:
     finally:
         vram_monitor.stop()
         _release_generation_request(request_id)
+
+
+@routes.post(f"{ROUTE_PREFIX}/media/materialize-workflow-image")
+async def materialize_workflow_reference_media(request: web.Request) -> web.Response:
+    busy = _generation_busy_error()
+    if busy is not None:
+        return busy
+    try:
+        reader = await request.multipart()
+    except Exception:
+        return _error("INVALID_REQUEST", "Expected multipart form data.", status=400)
+
+    session_id: str | None = None
+    mode: str | None = None
+    plan: dict[str, Any] | None = None
+    source_path: Path | None = None
+    asset_dir: Path | None = None
+    media_claimed = False
+    replace_asset_id: str | None = request.query.get("replace_asset_id") or None
+    source_filename = "workflow-reference.png"
+
+    def rollback() -> None:
+        if asset_dir is not None:
+            shutil.rmtree(asset_dir, ignore_errors=True)
+
+    try:
+        while field := await reader.next():
+            if field.name == "session_id":
+                session_id = parse_session_id((await field.text()).strip() or None)
+                continue
+            if field.name == "mode":
+                mode = (await field.text()).strip()
+                continue
+            if field.name == "replace_asset_id":
+                replace_asset_id = (await field.text()).strip() or None
+                continue
+            if field.name == "materialization_plan":
+                try:
+                    plan = normalize_workflow_materialization_plan(json.loads(await field.text()))
+                except json.JSONDecodeError as error:
+                    raise MediaError(
+                        "INVALID_WORKFLOW_MATERIALIZATION",
+                        "Workflow image materialization plan is not valid JSON.",
+                    ) from error
+                continue
+            if field.name != "file" or not field.filename:
+                continue
+            if source_path is not None:
+                raise MediaError("INVALID_WORKFLOW_MATERIALIZATION", "Workflow materialization accepts exactly one source image.")
+            if session_id is None:
+                session_id = parse_session_id(None)
+            if mode != "Reference":
+                raise MediaError(
+                    "INVALID_MODE",
+                    "Workflow image materialization is only available in Reference mode.",
+                )
+            asset_dir = CACHE_ROOT / session_id / str(uuid4())
+            asset_dir.mkdir(parents=True, exist_ok=False)
+            extension = Path(field.filename).suffix.lower() or ".img"
+            source_path = asset_dir / f"workflow_source{extension}"
+            source_filename = Path(field.filename).name or "workflow-reference.png"
+            size = 0
+            with source_path.open("wb") as output:
+                while chunk := await field.read_chunk(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_FILE_BYTES:
+                        raise MediaError("MEDIA_TOO_LARGE", "A media file cannot exceed 1 GB.")
+                    output.write(chunk)
+
+        if session_id is None or source_path is None or asset_dir is None:
+            raise MediaError("INVALID_REQUEST", "Workflow materialization requires one source image.")
+        if mode != "Reference":
+            raise MediaError("INVALID_MODE", "Workflow image materialization is only available in Reference mode.")
+        if plan is None:
+            raise MediaError("INVALID_WORKFLOW_MATERIALIZATION", "Workflow image materialization plan is missing.")
+        if not _claim_media_mutation():
+            raise MediaError("GENERATION_BUSY", "Media cannot be changed while H3 Prompt Writer is generating or refining.")
+        media_claimed = True
+
+        target_path = asset_dir / "original.png"
+        _materialized, cancellation = await _run_thread_worker(
+            materialize_workflow_image,
+            source_path,
+            target_path,
+            plan,
+        )
+        _propagate_worker_cancellation(cancellation)
+        source_path.unlink(missing_ok=True)
+        materialized_filename = f"{Path(source_filename).stem or 'workflow-reference'}-materialized.png"
+
+        if replace_asset_id:
+            old_asset = STORE.get(session_id, replace_asset_id)
+            if old_asset["mode"] != "Reference":
+                raise MediaError("INVALID_REPLACEMENT", "The replacement must stay in Reference mode.")
+            prepared, cancellation = await _run_thread_worker(
+                STORE.prepare_replace,
+                session_id,
+                replace_asset_id,
+                materialized_filename,
+                "image/png",
+                target_path,
+            )
+            _propagate_worker_cancellation(cancellation)
+            asset = STORE.commit_replace(session_id, replace_asset_id, prepared)
+            asset_dir = None
+            _invalidate_generation_cache(session_id, "Reference")
+            return web.json_response(
+                {"session_id": session_id, "asset": asset, "assets": STORE.list(session_id)},
+                status=201,
+            )
+
+        prepared, cancellation = await _run_thread_worker(
+            STORE.prepare_add,
+            session_id,
+            "Reference",
+            materialized_filename,
+            "image/png",
+            target_path,
+        )
+        _propagate_worker_cancellation(cancellation)
+        asset = STORE.commit_add(session_id, "Reference", prepared)
+        asset_dir = None
+        _invalidate_generation_cache(session_id, "Reference")
+        return web.json_response({"session_id": session_id, "assets": [asset]}, status=201)
+    except (MediaError, ValueError) as error:
+        rollback()
+        if isinstance(error, MediaError):
+            status = 409 if error.code == "GENERATION_BUSY" else 400
+            return _media_error(error, status=status)
+        return _error("INVALID_SESSION", "The media session ID is invalid.", status=400)
+    except BaseException:
+        rollback()
+        raise
+    finally:
+        if media_claimed:
+            _release_media_mutation()
 
 
 @routes.post(f"{ROUTE_PREFIX}/media/upload")

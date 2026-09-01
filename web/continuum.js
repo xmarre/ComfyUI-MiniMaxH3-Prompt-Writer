@@ -404,6 +404,9 @@ const IMAGE_CONVEYOR_LAST_FRAME_OUTPUT = 14;
 const IMAGE_CONVEYOR_REFERENCE_PROPERTY = "image_conveyor_reference_enabled";
 const IMAGE_CONVEYOR_MAIN_PROPERTY = "image_conveyor_main_enabled";
 const IMAGE_CONVEYOR_LAST_FRAME_PROPERTY = "image_conveyor_last_frame_enabled";
+const SCALE_IMAGE_TOTAL_PIXELS_X_NODE_CLASS = "ImageScaleToTotalPixelsX";
+const SCALE_IMAGE_TOTAL_PIXELS_X_CONTRACT_SHA = "79e831097bb7a76ade3a28359300e62332086c42";
+const SCALE_IMAGE_TOTAL_PIXELS_X_PLAN_VERSION = 1;
 
 function jsonObject(value) {
   if (typeof value !== "string" || !value.trim()) return null;
@@ -680,7 +683,123 @@ function imageConveyorWorkflowMedia(graph, connection) {
   };
 }
 
+function scaleImageToTotalPixelsXPlan(node) {
+  if (nodeClassId(node) !== SCALE_IMAGE_TOTAL_PIXELS_X_NODE_CLASS) return null;
+  const dynamicParameter = (node?.inputs || []).find((input) => (
+    ["width", "height", "megapixels", "multiple_of", "resize_mode", "upscale_method"].includes(input?.name)
+    && input?.link != null
+  ));
+  if (dynamicParameter) {
+    return {
+      supported: false,
+      reason: "dynamic_transform_parameters",
+      dynamic_parameter: String(dynamicParameter.name),
+    };
+  }
+
+  const megapixels = Number(widget(node, "megapixels")?.value);
+  const multipleOf = Number(widget(node, "multiple_of")?.value);
+  const resizeMode = String(widget(node, "resize_mode")?.value ?? "").trim().toLowerCase();
+  const upscaleMethod = String(widget(node, "upscale_method")?.value ?? "").trim().toLowerCase();
+  if (
+    !Number.isFinite(megapixels)
+    || megapixels < 0
+    || megapixels > 16
+    || !Number.isInteger(multipleOf)
+    || multipleOf < 1
+    || multipleOf > 128
+    || !["stretch", "crop", "pad"].includes(resizeMode)
+  ) {
+    return { supported: false, reason: "unsupported_transform_configuration" };
+  }
+  if (upscaleMethod !== "lanczos") {
+    return { supported: false, reason: "unsupported_transform_method" };
+  }
+  return {
+    supported: true,
+    plan: {
+      kind: "image_scale_to_total_pixels_x",
+      version: SCALE_IMAGE_TOTAL_PIXELS_X_PLAN_VERSION,
+      node_class: SCALE_IMAGE_TOTAL_PIXELS_X_NODE_CLASS,
+      contract_sha: SCALE_IMAGE_TOTAL_PIXELS_X_CONTRACT_SHA,
+      megapixels,
+      multiple_of: multipleOf,
+      resize_mode: resizeMode,
+      upscale_method: upscaleMethod,
+    },
+  };
+}
+
+function directStableWorkflowImageMedia(graph, connection) {
+  const conveyor = imageConveyorWorkflowMedia(graph, connection);
+  if (conveyor?.importable) return conveyor;
+  const directLoadImage = directLoadImageWorkflowMedia(connection);
+  if (directLoadImage?.importable) return directLoadImage;
+  return conveyor || directLoadImage || null;
+}
+
+function scaleImageToTotalPixelsXWorkflowMedia(graph, connection) {
+  const node = connection?.source;
+  if (nodeClassId(node) !== SCALE_IMAGE_TOTAL_PIXELS_X_NODE_CLASS) return null;
+  if (Number(connection?.link?.origin_slot) !== 0) {
+    return {
+      importable: false,
+      reason: "unsupported_transform_output",
+      source_kind: "scale_image_to_total_pixels_x",
+      source_label: "Scale Image to Total Pixels Adv",
+    };
+  }
+
+  const planState = scaleImageToTotalPixelsXPlan(node);
+  if (!planState?.supported) {
+    return {
+      importable: false,
+      reason: planState?.reason || "unsupported_transform_configuration",
+      source_kind: "scale_image_to_total_pixels_x",
+      source_label: "Scale Image to Total Pixels Adv",
+    };
+  }
+
+  const imageInput = (node?.inputs || []).find((input) => input?.name === "image");
+  const upstream = imageInput?.link == null
+    ? null
+    : resolveSourceConnection(graph, imageInput.link, imageInput.type ?? "IMAGE");
+  if (!upstream) {
+    return {
+      importable: false,
+      reason: "missing_transform_source",
+      source_kind: "scale_image_to_total_pixels_x",
+      source_label: "Scale Image to Total Pixels Adv",
+    };
+  }
+  const source = directStableWorkflowImageMedia(graph, { input: imageInput, ...upstream });
+  if (!source?.importable || !source.file || !source.source_identity) {
+    return {
+      importable: false,
+      reason: "unsupported_transform_source",
+      source_kind: "scale_image_to_total_pixels_x",
+      source_label: "Scale Image to Total Pixels Adv",
+    };
+  }
+
+  const materializationPlan = planState.plan;
+  const sourceIdentity = `workflow-materialized-v1:${opaqueStateFingerprint(JSON.stringify([
+    source.source_identity,
+    materializationPlan,
+  ]))}`;
+  return {
+    ...source,
+    importable: true,
+    source_kind: "scale_image_to_total_pixels_x",
+    source_label: `${source.source_label} → Scale Image to Total Pixels Adv`,
+    source_identity: sourceIdentity,
+    materialization_plan: materializationPlan,
+  };
+}
+
 function workflowImageMediaDescriptor(graph, connection) {
+  const materialized = scaleImageToTotalPixelsXWorkflowMedia(graph, connection);
+  if (materialized) return materialized;
   const conveyor = imageConveyorWorkflowMedia(graph, connection);
   if (conveyor) return conveyor;
   const directLoadImage = directLoadImageWorkflowMedia(connection);
@@ -694,6 +813,8 @@ function workflowImageMediaDescriptor(graph, connection) {
 }
 
 function workflowSourceIdentityDescriptor(graph, connection) {
+  const materialized = scaleImageToTotalPixelsXWorkflowMedia(graph, connection);
+  if (materialized?.source_identity) return { source_identity: materialized.source_identity };
   const conveyor = imageConveyorSourceIdentityDescriptor(graph, connection);
   if (conveyor.source_identity) return conveyor;
   const directLoadImage = directLoadImageWorkflowMedia(connection);

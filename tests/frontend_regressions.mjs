@@ -2074,3 +2074,19 @@ test("manual replacement of an imported workflow copy drops its binding after a 
     /if \(replaceAssetId\) forgetWorkflowReferenceAsset\(replaceAssetId\);/,
   );
 });
+
+
+test("workflow reference import routes reviewed transforms through backend materialization", () => {
+  assert.match(mainSource, /candidate\.materialization_plan/);
+  assert.match(mainSource, /materializeWorkflowImage/);
+  assert.match(mainSource, /Unsupported resize method/);
+  assert.match(mainSource, /Dynamic resize inputs/);
+});
+
+
+test("bound transformed workflow references preview the exact Writer-visible asset", () => {
+  assert.match(
+    mainSource,
+    /binding\.state === "current" && binding\.asset\?\.preview_url/,
+  );
+});

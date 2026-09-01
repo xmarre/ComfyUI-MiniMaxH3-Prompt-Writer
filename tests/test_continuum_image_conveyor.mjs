@@ -358,6 +358,7 @@ test("processed Conveyor reference chains remain active conditioning but refuse 
     referenceSlots: [ref("one"), ...Array(7).fill(null)],
   });
   const transform = transformNode();
+  transform.type = "UnsupportedImageTransform";
   const { app, connect } = graphWith([sampler, conveyor, transform]);
   connect(conveyor, 6, transform, "image");
   connect(transform, 0, sampler, "reference_image_1");
@@ -434,6 +435,101 @@ test("Apply-to-Continuum source comparison ignores Prompt Writer media binding w
   const changed = structuredClone(active);
   changed.items[0].source_identity = "image-conveyor-ref-v1:ffffffffffffffff";
   assert.equal(sameContinuumWorkflowSourceInventory(saved, changed), false);
+});
+
+test("reviewed Scale Image to Total Pixels Adv chain is materializable and transform-aware", () => {
+  const sampler = samplerNode();
+  const conveyor = conveyorNode({
+    referenceSlots: [ref("one"), ...Array(7).fill(null)],
+  });
+  const scale = {
+    id: 60,
+    type: "ImageScaleToTotalPixelsX",
+    inputs: [
+      { name: "image", type: "IMAGE", link: null },
+      { name: "width", type: "INT", link: null },
+      { name: "height", type: "INT", link: null },
+    ],
+    outputs: [
+      { name: "image", type: "IMAGE", links: [] },
+      { name: "width", type: "INT", links: [] },
+      { name: "height", type: "INT", links: [] },
+    ],
+    widgets: [
+      { name: "megapixels", value: 0.70 },
+      { name: "multiple_of", value: 32 },
+      { name: "resize_mode", value: "crop" },
+      { name: "upscale_method", value: "lanczos" },
+    ],
+  };
+  const { app, connect } = graphWith([sampler, conveyor, scale]);
+  connect(conveyor, 6, scale, "image");
+  connect(scale, 0, sampler, "reference_image_1");
+
+  const discovered = discoverContinuumWorkflowImageMedia(app, sampler);
+  const candidate = discovered.candidates[0];
+  assert.equal(candidate.importable, true);
+  assert.equal(candidate.source_kind, "scale_image_to_total_pixels_x");
+  assert.equal(candidate.materialization_plan.contract_sha, "79e831097bb7a76ade3a28359300e62332086c42");
+  assert.deepEqual(candidate.materialization_plan, {
+    kind: "image_scale_to_total_pixels_x",
+    version: 1,
+    node_class: "ImageScaleToTotalPixelsX",
+    contract_sha: "79e831097bb7a76ade3a28359300e62332086c42",
+    megapixels: 0.70,
+    multiple_of: 32,
+    resize_mode: "crop",
+    upscale_method: "lanczos",
+  });
+  assert.match(candidate.source_identity, /^workflow-materialized-v1:[0-9a-f]{16}$/);
+  assert.equal(discovered.inventory.items[0].source_identity, candidate.source_identity);
+
+  const before = candidate.source_identity;
+  scale.widgets.find((entry) => entry.name === "megapixels").value = 0.80;
+  const after = discoverContinuumWorkflowImageMedia(app, sampler).candidates[0].source_identity;
+  assert.notEqual(after, before);
+});
+
+test("Scale Image to Total Pixels Adv fails closed for dynamic overrides and unreviewed resize methods", () => {
+  const sampler = samplerNode();
+  const conveyor = conveyorNode({
+    referenceSlots: [ref("one"), ...Array(7).fill(null)],
+  });
+  const scale = {
+    id: 61,
+    type: "ImageScaleToTotalPixelsX",
+    inputs: [
+      { name: "image", type: "IMAGE", link: null },
+      { name: "width", type: "INT", link: 999 },
+      { name: "height", type: "INT", link: null },
+    ],
+    outputs: [{ name: "image", type: "IMAGE", links: [] }],
+    widgets: [
+      { name: "megapixels", value: 0.70 },
+      { name: "multiple_of", value: 32 },
+      { name: "resize_mode", value: "crop" },
+      { name: "upscale_method", value: "lanczos" },
+    ],
+  };
+  const { app, connect } = graphWith([sampler, conveyor, scale]);
+  connect(conveyor, 6, scale, "image");
+  connect(scale, 0, sampler, "reference_image_1");
+
+  let candidate = discoverContinuumWorkflowImageMedia(app, sampler).candidates[0];
+  assert.equal(candidate.importable, false);
+  assert.equal(candidate.reason, "dynamic_transform_parameters");
+
+  scale.inputs.find((entry) => entry.name === "width").link = null;
+  scale.inputs.push({ name: "megapixels", type: "FLOAT", link: 1001 });
+  candidate = discoverContinuumWorkflowImageMedia(app, sampler).candidates[0];
+  assert.equal(candidate.importable, false);
+  assert.equal(candidate.reason, "dynamic_transform_parameters");
+
+  scale.inputs.find((entry) => entry.name === "megapixels").link = null;
+  scale.widgets.find((entry) => entry.name === "upscale_method").value = "bicubic";
+  candidate = discoverContinuumWorkflowImageMedia(app, sampler).candidates[0];
+  assert.equal(candidate.importable, false);
+  assert.equal(candidate.reason, "unsupported_transform_method");
 });
 
 test("unreadable Image Conveyor state fails closed instead of inventing public identities", () => {

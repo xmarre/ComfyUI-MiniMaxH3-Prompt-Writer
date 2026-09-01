@@ -13,6 +13,10 @@
 
 ### Reliability
 
+- Added exact pre-execution materialization for stable workflow references passed through the reviewed `ImageScaleToTotalPixelsX` / **Scale Image to Total Pixels Adv** node (contract pinned to `79e831097bb7a76ade3a28359300e62332086c42`). Static megapixel/multiple and stretch/crop/pad chains using Lanczos now import the transformed H3 reference instead of being rejected as a generic processed image chain.
+- Transform settings are included in downstream source identity, so changing scaler parameters produces **Update needed**. Any connected runtime override for width, height, megapixels, multiple-of, resize mode, or interpolation fails closed rather than using a stale widget value; non-Lanczos methods, animated sources, unsupported upstreams, and arbitrary processing chains remain unavailable.
+- After materialization, the Active workflow images row previews the actual post-transform Prompt Writer asset seen by the prompt model rather than the upstream source thumbnail.
+- Added a dedicated backend materialization endpoint, exact Lanczos/crop geometry regression tests, route coverage, frontend chain tests, and a pinned cross-repository scaler contract CI lane.
 - Added the missing **Active workflow images** UI for Reference + H3 Continuum, including **Add active workflow refs**, per-slot Add/Update state, ComfyUI image materialization for stable Image Conveyor Reference Shelf and direct Load Image sources, and exact downstream `model_asset_id` binding so the prompt model can inspect the same references that will condition H3.
 - Dynamic queue-group/queue-driven sources and processed image chains remain visible as active workflow conditioning but are deliberately not imported as fake stable media when their exact execution pixels are not available yet.
 - Apply-to-Continuum now compares downstream workflow source identity separately from Prompt Writer media visibility/binding, so a correctly bound model-visible copy does not look like graph source drift.

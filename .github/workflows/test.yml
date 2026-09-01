@@ -188,6 +188,33 @@ jobs:
         working-directory: .image-conveyor-source
         run: node --test tests/test_reference_toggles.mjs tests/test_toggle_state_sync.mjs tests/test_queue_groups.mjs
 
+  scale-image-total-pixels-x-contract:
+    name: Scale Image to Total Pixels Adv · reviewed contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Prompt Writer
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out reviewed scaler source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: BigStationW/ComfyUi-Scale-Image-to-Total-Pixels-Advanced
+          ref: 79e831097bb7a76ade3a28359300e62332086c42
+          path: .scale-image-total-pixels-x-source
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run scaler cross-repository contract
+        env:
+          SCALE_IMAGE_TOTAL_PIXELS_X_SOURCE: ${{ github.workspace }}/.scale-image-total-pixels-x-source
+        run: python -m unittest discover -s tests -p "test_scale_image_total_pixels_x_cross_repo.py"
+
   hygiene:
     name: Repository hygiene
     runs-on: ubuntu-latest

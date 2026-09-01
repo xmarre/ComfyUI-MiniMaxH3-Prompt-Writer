@@ -73,6 +73,16 @@ export async function fetchComfyImageFile(source, filenameOverride = null) {
   return new File([blob], filenameOverride || filename, { type: contentType });
 }
 
+export function materializeWorkflowImage(sessionId, mode, file, plan, replaceAssetId = null) {
+  const body = new FormData();
+  body.append("session_id", sessionId);
+  body.append("mode", mode);
+  body.append("materialization_plan", JSON.stringify(plan));
+  body.append("file", file);
+  const replace = replaceAssetId ? `?replace_asset_id=${encodeURIComponent(replaceAssetId)}` : "";
+  return request(`/media/materialize-workflow-image${replace}`, { method: "POST", body });
+}
+
 export function uploadMedia(sessionId, mode, files, replaceAssetId = null) {
   const body = new FormData();
   body.append("session_id", sessionId);

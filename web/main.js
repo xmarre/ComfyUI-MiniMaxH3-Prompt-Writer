@@ -1,5 +1,5 @@
 import { app } from "/scripts/app.js";
-import { cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, fetchComfyImageFile, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, resampleMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
+import { cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, fetchComfyImageFile, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, materializeWorkflowImage, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, resampleMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
 import { availableReferenceTags, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
 import {
   applySequenceToContinuum,
@@ -426,7 +426,13 @@ function workflowReferenceReason(candidate) {
   return {
     dynamic_queue_group: "Dynamic queue-group image; the file is chosen when the workflow is queued.",
     queue_driven_output: "Queue-driven image; there is no stable file to attach before execution.",
-    processed_image_chain: "This slot passes through an image-processing node; Writer cannot copy the exact runtime pixels before execution.",
+    processed_image_chain: "This slot passes through an unsupported image-processing chain; Writer cannot copy the exact runtime pixels before execution.",
+    dynamic_transform_parameters: "Scale Image to Total Pixels Adv has connected width/height overrides, so its final pixels are dynamic.",
+    unsupported_transform_configuration: "Scale Image to Total Pixels Adv has a configuration Writer cannot reproduce safely.",
+    unsupported_transform_method: "Only Lanczos Scale Image to Total Pixels Adv chains are currently materialized exactly.",
+    unsupported_transform_output: "Writer only materializes the image output of Scale Image to Total Pixels Adv.",
+    missing_transform_source: "Scale Image to Total Pixels Adv has no resolvable static image source.",
+    unsupported_transform_source: "Scale Image to Total Pixels Adv is fed by a source that Writer cannot materialize exactly.",
     unreadable_reference_file: "The active Reference Shelf slot has no readable ComfyUI file descriptor.",
     unsupported_runtime_source: "This active workflow source cannot be materialized into Writer media safely.",
     missing_connection: "The active workflow image connection could not be resolved.",
@@ -467,7 +473,12 @@ function renderWorkflowReferencePanel() {
 
   const rows = candidates.map((candidate, index) => {
     const binding = workflowBindingStatus(candidate);
-    const preview = candidate.importable ? workflowReferencePreviewUrl(candidate) : "";
+    // Once a stable workflow source has been imported, show the exact Writer
+    // asset the prompt model will inspect. For a materialized transform this is
+    // the post-transform image, not the upstream source thumbnail.
+    const preview = binding.state === "current" && binding.asset?.preview_url
+      ? binding.asset.preview_url
+      : candidate.importable ? workflowReferencePreviewUrl(candidate) : "";
     const status = binding.state === "current"
       ? "Writer can see"
       : binding.state === "stale"
@@ -476,7 +487,11 @@ function renderWorkflowReferencePanel() {
           ? "Workflow only"
           : candidate.reason === "dynamic_queue_group" || candidate.reason === "queue_driven_output"
             ? "Dynamic at execution"
-            : "Exact pixels unavailable";
+            : candidate.reason === "unsupported_transform_method"
+              ? "Unsupported resize method"
+              : candidate.reason === "dynamic_transform_parameters"
+                ? "Dynamic resize inputs"
+                : "Exact pixels unavailable";
     const action = candidate.importable
       ? `<button type="button" data-workflow-ref-add="${index}" ${studio.workflowReferenceImportBusy || binding.state === "current" ? "disabled" : ""}>${binding.state === "current" ? "Added" : binding.state === "stale" ? "Update" : "Add"}</button>`
       : `<button type="button" disabled title="${escapeHtml(workflowReferenceReason(candidate))}">Unavailable</button>`;
@@ -530,7 +545,15 @@ async function importWorkflowReferenceCandidates(candidates) {
       const before = workflowBindingStatus(candidate);
       const file = await fetchComfyImageFile(candidate.file, candidate.file.filename);
       const replaceAssetId = before.asset?.id || null;
-      const result = await uploadMedia(studio.sessionId, "Reference", [file], replaceAssetId);
+      const result = candidate.materialization_plan
+        ? await materializeWorkflowImage(
+          studio.sessionId,
+          "Reference",
+          file,
+          candidate.materialization_plan,
+          replaceAssetId,
+        )
+        : await uploadMedia(studio.sessionId, "Reference", [file], replaceAssetId);
       let assetId = replaceAssetId;
       if (replaceAssetId) {
         studio.assets = result.assets;
