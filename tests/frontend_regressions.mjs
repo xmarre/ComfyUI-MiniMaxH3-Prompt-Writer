@@ -306,6 +306,34 @@ test("Continuum inventory identity compares semantic fields independently of obj
   assert.equal(sameContinuumReferenceInventory(left, right), false);
 });
 
+test("Continuum inventory identity treats a missing saved source fingerprint as legacy unknown but enforces it once saved", () => {
+  const legacy = {
+    schema_version: 1,
+    items: [{
+      role: "reference_image",
+      kind: "image",
+      source: "workflow",
+      visible_to_model: false,
+      tag: "<Picture 1>",
+      source_node_id: 41,
+      source_node_class: "ImageConveyor",
+      source_output_name: "ref_image_1",
+      source_slot: 6,
+    }],
+  };
+  const active = structuredClone(legacy);
+  active.items[0].source_identity = "image-conveyor-ref-v1:1111111111111111";
+
+  assert.equal(sameContinuumReferenceInventory(legacy, active), true);
+
+  const saved = structuredClone(active);
+  active.items[0].source_identity = "image-conveyor-ref-v1:2222222222222222";
+  assert.equal(sameContinuumReferenceInventory(saved, active), false);
+
+  const activeWithoutFingerprint = structuredClone(legacy);
+  assert.equal(sameContinuumReferenceInventory(saved, activeWithoutFingerprint), false);
+});
+
 test("Continuum graph handoff writes Timeline and treats Prompt Format as an explicit setting", () => {
   const { app, samplers, textWidget, graph } = continuumGraph();
   const choice = chooseContinuumSampler(app);

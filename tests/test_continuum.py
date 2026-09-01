@@ -28,6 +28,7 @@ from backend.continuum import (
     validate_continuum_settings,
     validate_continuum_mode_topology,
     validate_generated_chunk,
+    validate_saved_downstream_inventory,
     validate_sequence_plan,
     validate_sequence_reference_scope,
 )
@@ -272,6 +273,50 @@ class DownstreamReferenceInventoryTests(unittest.TestCase):
                 ("driving_audio", None),
             ],
         )
+
+    def test_optional_source_identity_is_preserved_and_must_be_nonempty_text(self):
+        value = downstream_inventory(1)
+        value["items"][0]["source_identity"] = "image-conveyor-ref-v1:0123456789abcdef"
+        normalized = normalize_downstream_reference_inventory(value)
+        self.assertEqual(
+            normalized["items"][0]["source_identity"],
+            "image-conveyor-ref-v1:0123456789abcdef",
+        )
+
+        for invalid in ("", "   ", 7):
+            broken = downstream_inventory(1)
+            broken["items"][0]["source_identity"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "source_identity"):
+                normalize_downstream_reference_inventory(broken)
+
+    def test_saved_inventory_source_identity_upgrades_legacy_and_then_detects_drift(self):
+        active = downstream_inventory(1)
+        active["items"][0]["source_identity"] = "image-conveyor-ref-v1:1111111111111111"
+
+        legacy = downstream_inventory(1)
+        upgraded = validate_saved_downstream_inventory(legacy, active)
+        self.assertEqual(
+            upgraded["items"][0]["source_identity"],
+            "image-conveyor-ref-v1:1111111111111111",
+        )
+
+        same = downstream_inventory(1)
+        same["items"][0]["source_identity"] = "image-conveyor-ref-v1:1111111111111111"
+        self.assertEqual(
+            validate_saved_downstream_inventory(same, active)["items"][0]["source_identity"],
+            "image-conveyor-ref-v1:1111111111111111",
+        )
+
+        changed = downstream_inventory(1)
+        changed["items"][0]["source_identity"] = "image-conveyor-ref-v1:2222222222222222"
+        with self.assertRaises(ContinuumError) as raised:
+            validate_saved_downstream_inventory(changed, active)
+        self.assertEqual(raised.exception.code, "CONTINUUM_REFERENCE_SOURCE_DRIFT")
+
+        no_fingerprint = downstream_inventory(1)
+        with self.assertRaises(ContinuumError) as raised:
+            validate_saved_downstream_inventory(same, no_fingerprint)
+        self.assertEqual(raised.exception.code, "CONTINUUM_REFERENCE_SOURCE_DRIFT")
 
     def test_gapped_public_picture_numbers_are_rejected(self):
         value = downstream_inventory(2)
@@ -536,6 +581,22 @@ class SequencePlanTests(unittest.TestCase):
             value = plan_v2(preamble=preamble)
             with self.subTest(preamble=preamble), self.assertRaises(ContinuumError):
                 validate_sequence_plan(value, settings(), expected_references=set())
+
+    def test_internal_global_planning_text_may_be_empty_but_must_remain_text(self):
+        value = plan_v2()
+        value["global"]["continuity_anchors"] = ""
+        value["global"]["persistent_constraints"] = "   "
+        validated = validate_sequence_plan(value, settings(), expected_references=set())
+        self.assertEqual(validated["global"]["continuity_anchors"], "")
+        self.assertEqual(validated["global"]["persistent_constraints"], "")
+
+        for field in ("continuity_anchors", "persistent_constraints"):
+            invalid = plan_v2()
+            invalid["global"][field] = None
+            with self.subTest(field=field), self.assertRaises(ContinuumError) as raised:
+                validate_sequence_plan(invalid, settings(), expected_references=set())
+            self.assertEqual(raised.exception.details["field"], f"global.{field}")
+            self.assertIn("must be text", raised.exception.message)
 
     def test_plan_rejects_reference_identity_drift_in_preamble_or_chunk_state(self):
         preamble_drift = plan_v2(preamble="Keep <Picture 2> fixed.")
@@ -887,14 +948,16 @@ class ContinuumAssemblyTests(unittest.TestCase):
         self.assertIn("Every inventory entry with an explicit public tag owns that exact H3 prompt identity", user)
         self.assertIn("tagged First Frame is opening-chunk-only", user)
 
-    def test_plan_repair_is_narrow_and_keeps_application_owned_fields_out(self):
+    def test_plan_repair_audits_the_complete_contract_and_keeps_application_owned_fields_out(self):
         error = ContinuumError("INVALID_CONTINUUM_PLAN", "Bad shape.", {"field": "chunks"})
         with patch("backend.assembly.STORE.manifest", return_value=manifest()):
             assembled = assemble_continuum_plan_repair_request(body(), "{bad", error)
         system = assembled["messages"][0]["content"]
-        self.assertIn("Repair only the sequence-plan contract", system)
+        self.assertIn("first validation failure", system)
+        self.assertIn("repair every contract violation", system)
+        self.assertIn("whole object to validate", system)
         self.assertIn("Do not add application-owned chunk indexes", system)
-        self.assertIn("Bad shape.", assembled["messages"][1]["content"])
+        self.assertIn("First validation error: Bad shape.", assembled["messages"][1]["content"])
 
     def test_generated_chunk_rejects_subject_when_plan_declares_no_subjects(self):
         request = body()

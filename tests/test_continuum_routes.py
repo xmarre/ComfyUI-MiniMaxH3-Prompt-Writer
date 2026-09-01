@@ -209,6 +209,22 @@ class ContinuumRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[6.5-13s]\nTwo.", prompt)
         self.assertIn("[13-19.5s]\nThree.", prompt)
 
+    async def test_empty_internal_planning_fields_do_not_trigger_repair(self):
+        planned = _plan()
+        planned["global"]["continuity_anchors"] = ""
+        planned["global"]["persistent_constraints"] = ""
+        response, stage, _backend = await self.run_sequence([
+            {"prompt": json.dumps(planned)},
+            {"prompt": "Prompt one."},
+            {"prompt": "Prompt two."},
+        ])
+        self.assertEqual(response.status, 200)
+        payload = self.payload(response)
+        self.assertFalse(payload["planner_repair_attempted"])
+        self.assertEqual(payload["sequence"]["plan"]["global"]["continuity_anchors"], "")
+        self.assertEqual(payload["sequence"]["plan"]["global"]["persistent_constraints"], "")
+        self.assertEqual(stage.await_count, 3)
+
     async def test_malformed_plan_gets_exactly_one_narrow_repair(self):
         response, stage, _backend = await self.run_sequence([
             {"prompt": "not json"},

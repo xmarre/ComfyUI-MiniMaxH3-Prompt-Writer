@@ -139,6 +139,14 @@ def normalize_downstream_reference_inventory(value: Any) -> dict[str, Any]:
                     f"Downstream H3 reference inventory item {offset} source_slot must be a non-negative integer."
                 )
             item["source_slot"] = source_slot
+
+        source_identity = raw.get("source_identity")
+        if source_identity is not None:
+            if not isinstance(source_identity, str) or not source_identity.strip():
+                raise ValueError(
+                    f"Downstream H3 reference inventory item {offset} source_identity must be non-empty text."
+                )
+            item["source_identity"] = source_identity.strip()
         items.append(item)
 
     reference_images = [item for item in items if item["role"] == "reference_image"]

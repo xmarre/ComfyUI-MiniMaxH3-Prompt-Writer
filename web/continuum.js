@@ -197,6 +197,7 @@ function inventoryIdentityItem(item = {}) {
     source_node_class: item.source_node_class == null ? null : String(item.source_node_class),
     source_output_name: item.source_output_name == null ? null : String(item.source_output_name),
     source_slot: Number.isInteger(item.source_slot) ? item.source_slot : null,
+    source_identity: item.source_identity == null ? null : String(item.source_identity),
     model_asset_id: item.model_asset_id == null ? null : String(item.model_asset_id),
   };
 }
@@ -209,9 +210,22 @@ export function continuumInventoryIdentity(inventory) {
   };
 }
 
-export function sameContinuumReferenceInventory(left, right) {
-  return JSON.stringify(continuumInventoryIdentity(left))
-    === JSON.stringify(continuumInventoryIdentity(right));
+export function sameContinuumReferenceInventory(savedInventory, activeInventory) {
+  const saved = continuumInventoryIdentity(savedInventory);
+  const active = continuumInventoryIdentity(activeInventory);
+  if (saved.schema_version !== active.schema_version || saved.items.length !== active.items.length) return false;
+
+  return saved.items.every((savedValue, index) => {
+    const activeValue = active.items[index];
+    const savedItem = { ...savedValue, source_identity: null };
+    const activeItem = { ...activeValue, source_identity: null };
+    if (JSON.stringify(savedItem) !== JSON.stringify(activeItem)) return false;
+
+    // Inventories saved before source_identity existed use null as an unknown
+    // legacy identity. Once a saved fingerprint exists, it must match strictly.
+    return savedValue.source_identity == null
+      || savedValue.source_identity === activeValue.source_identity;
+  });
 }
 
 
@@ -362,6 +376,185 @@ function graphNode(graph, nodeId) {
 const NODE_MODE_NEVER = 2;
 const NODE_MODE_BYPASS = 4;
 
+const IMAGE_CONVEYOR_NODE_IDS = new Set(["ImageConveyor", "SequentialBatchImageLoader"]);
+const IMAGE_CONVEYOR_OUTPUT_MODE_PERSISTENT = "persistent_refs";
+const IMAGE_CONVEYOR_OUTPUT_MODE_QUEUE_GROUP = "queue_group";
+const IMAGE_CONVEYOR_REFERENCE_SLOTS = 8;
+const IMAGE_CONVEYOR_MAX_GROUP_IMAGES = 9;
+const IMAGE_CONVEYOR_REFERENCE_OUTPUT_START = 6;
+const IMAGE_CONVEYOR_LAST_FRAME_OUTPUT = 14;
+const IMAGE_CONVEYOR_REFERENCE_PROPERTY = "image_conveyor_reference_enabled";
+const IMAGE_CONVEYOR_MAIN_PROPERTY = "image_conveyor_main_enabled";
+const IMAGE_CONVEYOR_LAST_FRAME_PROPERTY = "image_conveyor_last_frame_enabled";
+
+function jsonObject(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function imageConveyorState(node) {
+  const serialized = jsonObject(widget(node, "state_json")?.value);
+  const live = node?.__bil?.state;
+  const liveState = live && typeof live === "object" && !Array.isArray(live) ? live : null;
+  if (!serialized && !liveState) {
+    throw new Error(`Image Conveyor ${String(node?.id ?? "")} has no readable state_json; Continuum reference topology cannot be resolved safely.`);
+  }
+  return { ...(serialized || {}), ...(liveState || {}) };
+}
+
+function normalizedConveyorGroupSize(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 1;
+  return Math.max(1, Math.min(IMAGE_CONVEYOR_MAX_GROUP_IMAGES, Math.trunc(number)));
+}
+
+function imageConveyorOutputMode(state) {
+  if (Object.hasOwn(state, "output_mode")) {
+    return String(state.output_mode ?? "").trim().toLowerCase() === IMAGE_CONVEYOR_OUTPUT_MODE_QUEUE_GROUP
+      ? IMAGE_CONVEYOR_OUTPUT_MODE_QUEUE_GROUP
+      : IMAGE_CONVEYOR_OUTPUT_MODE_PERSISTENT;
+  }
+  return normalizedConveyorGroupSize(state.images_per_execution) > 1
+    ? IMAGE_CONVEYOR_OUTPUT_MODE_QUEUE_GROUP
+    : IMAGE_CONVEYOR_OUTPUT_MODE_PERSISTENT;
+}
+
+function explicitConveyorToggle(node, state, propertyName, stateName) {
+  if (node?.properties && Object.hasOwn(node.properties, propertyName)) {
+    return node.properties[propertyName] !== false;
+  }
+  if (Object.hasOwn(state, stateName)) return state[stateName] !== false;
+  return true;
+}
+
+function imageConveyorReferenceEnabled(node, state, index) {
+  const propertyMask = node?.properties?.[IMAGE_CONVEYOR_REFERENCE_PROPERTY];
+  const stateMask = state.reference_output_enabled;
+  const mask = Array.isArray(propertyMask) ? propertyMask : Array.isArray(stateMask) ? stateMask : null;
+  return mask?.[index] !== false;
+}
+
+function imageConveyorOutputName(connection) {
+  const explicit = String(connection?.output?.name ?? connection?.output?.label ?? "").trim();
+  if (explicit) return explicit;
+  const slot = Number(connection?.link?.origin_slot);
+  if (slot === 0) return "image";
+  if (slot >= IMAGE_CONVEYOR_REFERENCE_OUTPUT_START && slot < IMAGE_CONVEYOR_REFERENCE_OUTPUT_START + IMAGE_CONVEYOR_REFERENCE_SLOTS) {
+    return `ref_image_${slot - IMAGE_CONVEYOR_REFERENCE_OUTPUT_START + 1}`;
+  }
+  if (slot === IMAGE_CONVEYOR_LAST_FRAME_OUTPUT) return "last_frame";
+  return "";
+}
+
+function imageConveyorReferenceOutputIndex(outputName) {
+  const match = /^ref_image_([1-8])$/.exec(outputName);
+  return match ? Number(match[1]) - 1 : -1;
+}
+
+function imageConveyorOutputIsActive(connection) {
+  const node = connection?.source;
+  if (!IMAGE_CONVEYOR_NODE_IDS.has(nodeClassId(node))) return true;
+
+  const state = imageConveyorState(node);
+  const mode = imageConveyorOutputMode(state);
+  const outputName = imageConveyorOutputName(connection);
+  const referenceIndex = imageConveyorReferenceOutputIndex(outputName);
+
+  if (mode === IMAGE_CONVEYOR_OUTPUT_MODE_QUEUE_GROUP) {
+    const count = normalizedConveyorGroupSize(state.images_per_execution);
+    if (outputName === "image") return count >= 1;
+    if (outputName === "last_frame") return count >= 2;
+    if (referenceIndex >= 0) return referenceIndex + 2 <= count;
+    return true;
+  }
+
+  if (outputName === "image") {
+    return explicitConveyorToggle(node, state, IMAGE_CONVEYOR_MAIN_PROPERTY, "main_output_enabled");
+  }
+  if (outputName === "last_frame") {
+    return explicitConveyorToggle(node, state, IMAGE_CONVEYOR_LAST_FRAME_PROPERTY, "last_frame_output_enabled");
+  }
+  if (referenceIndex >= 0) {
+    if (!imageConveyorReferenceEnabled(node, state, referenceIndex)) return false;
+    const slots = Array.isArray(state.reference_slots) ? state.reference_slots : [];
+    return slots[referenceIndex] != null;
+  }
+  return true;
+}
+
+function imageConveyorOriginForConnection(graph, connection, visited = new Set()) {
+  const source = connection?.source;
+  if (!source) return null;
+  if (IMAGE_CONVEYOR_NODE_IDS.has(nodeClassId(source))) return connection;
+
+  const sourceSlot = Number(connection?.link?.origin_slot);
+  const key = `${String(source.id ?? "")}:${Number.isFinite(sourceSlot) ? sourceSlot : "?"}`;
+  if (visited.has(key)) return null;
+  visited.add(key);
+
+  const outputType = connection?.output?.type ?? "IMAGE";
+  if (!slotTypesCompatible(outputType, "IMAGE")) return null;
+
+  const candidates = (source.inputs || []).filter((input) => (
+    input?.link != null
+    && slotTypesCompatible(input.type, outputType)
+    && slotTypesCompatible(input.type, "IMAGE")
+  ));
+  if (candidates.length !== 1) return null;
+
+  const input = candidates[0];
+  const upstream = resolveSourceConnection(graph, input.link, input.type ?? outputType);
+  if (!upstream) return null;
+  return imageConveyorOriginForConnection(graph, { input, ...upstream }, visited);
+}
+
+function connectionIsEffectivelyActive(graph, connection) {
+  if (!connection) return false;
+  const conveyorOrigin = imageConveyorOriginForConnection(graph, connection);
+  return conveyorOrigin ? imageConveyorOutputIsActive(conveyorOrigin) : true;
+}
+
+function opaqueStateFingerprint(value) {
+  const text = String(value ?? "");
+  let first = (0xdeadbeef ^ text.length) >>> 0;
+  let second = (0x41c6ce57 ^ text.length) >>> 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    first = Math.imul(first ^ code, 2654435761) >>> 0;
+    second = Math.imul(second ^ code, 1597334677) >>> 0;
+  }
+  first = Math.imul(first ^ (first >>> 16), 2246822507) >>> 0;
+  first ^= Math.imul(second ^ (second >>> 13), 3266489909);
+  second = Math.imul(second ^ (second >>> 16), 2246822507) >>> 0;
+  second ^= Math.imul(first ^ (first >>> 13), 3266489909);
+  return `${(second >>> 0).toString(16).padStart(8, "0")}${(first >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function imageConveyorSourceIdentityDescriptor(graph, connection) {
+  const conveyorOrigin = imageConveyorOriginForConnection(graph, connection);
+  if (!conveyorOrigin) return {};
+  const state = imageConveyorState(conveyorOrigin.source);
+  if (imageConveyorOutputMode(state) !== IMAGE_CONVEYOR_OUTPUT_MODE_PERSISTENT) return {};
+  const referenceIndex = imageConveyorReferenceOutputIndex(imageConveyorOutputName(conveyorOrigin));
+  if (referenceIndex < 0) return {};
+  const slot = Array.isArray(state.reference_slots) ? state.reference_slots[referenceIndex] : null;
+  if (!slot || typeof slot !== "object" || Array.isArray(slot)) return {};
+  const stableSlot = JSON.stringify([
+    String(slot.annotated ?? ""),
+    String(slot.filename ?? ""),
+    String(slot.subfolder ?? ""),
+    String(slot.type ?? ""),
+  ]);
+  return {
+    source_identity: `image-conveyor-ref-v1:${opaqueStateFingerprint(stableSlot)}`,
+  };
+}
+
 function slotTypesCompatible(inputType, outputType) {
   const liteGraph = globalThis.LiteGraph;
   if (typeof liteGraph?.isValidConnection === "function") {
@@ -436,7 +629,7 @@ export function discoverContinuumReferenceInventory(app, sampler) {
 
   const referenceConnections = CONTINUUM_REFERENCE_INPUTS
     .map((inputName) => ({ inputName, connection: sourceForInput(graph, sampler, inputName) }))
-    .filter((item) => item.connection);
+    .filter((item) => item.connection && connectionIsEffectivelyActive(graph, item.connection));
 
   referenceConnections.forEach(({ inputName, connection }, offset) => {
     items.push({
@@ -447,14 +640,18 @@ export function discoverContinuumReferenceInventory(app, sampler) {
       role: "reference_image",
       input_name: inputName,
       ...sourceDescriptor(connection),
+      ...imageConveyorSourceIdentityDescriptor(graph, connection),
     });
   });
 
   const roleConnections = new Map(
-    [...CONDITIONING_ROLES].map(([inputName, role]) => [
-      inputName,
-      { role, connection: sourceForInput(graph, sampler, inputName) },
-    ]),
+    [...CONDITIONING_ROLES].map(([inputName, role]) => {
+      const connection = sourceForInput(graph, sampler, inputName);
+      return [
+        inputName,
+        { role, connection: connection && connectionIsEffectivelyActive(graph, connection) ? connection : null },
+      ];
+    }),
   );
   const hasReferenceImages = referenceConnections.length > 0;
   let keyframePictureIndex = 0;
@@ -476,6 +673,7 @@ export function discoverContinuumReferenceInventory(app, sampler) {
       role: role.role,
       input_name: inputName,
       ...sourceDescriptor(connection),
+      ...imageConveyorSourceIdentityDescriptor(graph, connection),
     });
   }
 

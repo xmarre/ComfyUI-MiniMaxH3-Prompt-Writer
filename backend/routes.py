@@ -703,7 +703,7 @@ async def _generate_continuum(
             except ContinuumError as second_error:
                 raise ModelError(
                     second_error.code,
-                    "The sequence planner remained invalid after one narrow contract repair.",
+                    "The sequence planner remained invalid after one bounded complete-contract repair.",
                     {
                         "initial_error": {"code": first_error.code, "message": first_error.message, "details": first_error.details},
                         "repair_error": {"code": second_error.code, "message": second_error.message, "details": second_error.details},

@@ -167,6 +167,7 @@ def downstream_inventory_identity(value: Any) -> dict[str, Any]:
         "source_node_id",
         "source_node_class",
         "source_output_name",
+        "source_identity",
         "model_asset_id",
     )
     items = []
@@ -184,6 +185,32 @@ def downstream_inventory_identity(value: Any) -> dict[str, Any]:
     }
 
 
+def _saved_downstream_inventory_matches(
+    saved_inventory: dict[str, Any],
+    active_inventory: dict[str, Any],
+) -> bool:
+    saved_identity = downstream_inventory_identity(saved_inventory)
+    active_identity = downstream_inventory_identity(active_inventory)
+    if saved_identity["schema_version"] != active_identity["schema_version"]:
+        return False
+    if len(saved_identity["items"]) != len(active_identity["items"]):
+        return False
+
+    for saved_item, active_item in zip(saved_identity["items"], active_identity["items"]):
+        saved_item = dict(saved_item)
+        active_item = dict(active_item)
+        saved_source_identity = saved_item.pop("source_identity", None)
+        active_source_identity = active_item.pop("source_identity", None)
+        if saved_item != active_item:
+            return False
+        # Snapshots created before source_identity existed are accepted once as
+        # an unknown legacy identity. A saved fingerprint, however, is strict:
+        # the active source must expose the same fingerprint.
+        if saved_source_identity is not None and saved_source_identity != active_source_identity:
+            return False
+    return True
+
+
 def validate_saved_downstream_inventory(
     saved_inventory: Any,
     active_inventory: Any,
@@ -192,7 +219,7 @@ def validate_saved_downstream_inventory(
     if saved_inventory is None:
         return active
     saved = normalized_downstream_inventory(saved_inventory)
-    if downstream_inventory_identity(saved) != downstream_inventory_identity(active):
+    if not _saved_downstream_inventory_matches(saved, active):
         raise ContinuumError(
             "CONTINUUM_REFERENCE_SOURCE_DRIFT",
             (
@@ -204,7 +231,9 @@ def validate_saved_downstream_inventory(
                 "active_inventory": active,
             },
         )
-    return saved
+    # Return the active normalized snapshot so a successful refinement upgrades
+    # legacy pre-fingerprint inventories and future shelf replacements become strict.
+    return active
 
 
 def _stable_reference_inventory(request_input: dict[str, Any]) -> list[dict[str, Any]]:
@@ -470,7 +499,7 @@ def _planner_schema(settings: dict[str, Any]) -> str:
     )
 
 
-CONTINUUM_PLAN_SYSTEM_PROMPT = """Plan one coherent MiniMax H3 Continuum sequence and return one JSON object with no Markdown fence or commentary. The application owns chunk count, time boundaries, public reference numbering, and output serialization; do not reproduce those values as bookkeeping fields. The global.sequence_preamble is the common Continuum prompt text that will be prepended verbatim to every logical chunk. It must contain only facts and instructions that truly persist across every chunk: stable subject identity and appearance, stable speaker/voice identity when vocalization recurs, persistent Reference Image or Video Reference roles, wardrobe/prop/environment/style continuity, genuinely global camera/lighting/audio rules, exclusions, and temporal-continuity constraints. Public Reference Images and <Video 1> are persistent when present. A public First Frame <Picture N> identity is opening-chunk-only in a multi-chunk sequence; a public Last Frame <Picture N> identity is final-chunk-only; neither may appear in the shared preamble unless the sequence has only one chunk. Driving Audio is persistent conditioning and owns no <Audio N> prompt tag. Do not place chunk-local action, dialogue, later-shot changes, or a final-frame target in the shared preamble when they do not apply to every chunk. Internal planning fields continuity_anchors, persistent_constraints, and each chunk's start/action/end state must stay compact and semantic rather than reading like final prompt meta. Preserve the user's explicit dialogue and lyrics verbatim, visible text verbatim, reference semantics, exclusions, camera rules, sound rules, and intended ending. Treat explicitly assigned reference roles as exclusive: do not transfer unrelated identity, clothing, setting, lighting, camera, motion, or audio traits from a source unless the user asks for them. Do not infer dialogue, lyrics, a transcript, or exact audio content from Driving Audio or any other conditioning that is not visible/audible to the prompt model. A later chunk continues from the previous end_state unless continuity is intentional_break. Use intentional_break only for a requested cut, location/time/wardrobe change, entrance/exit, camera reset, major framing change, or another deliberate discontinuity, and explain it in transition. Do not emit reference_assignments: Prompt Writer injects authoritative downstream H3 public reference identities. subject_anchors must be [] when no stable subject identity is needed; otherwise every entry is exactly {"id":"<Subject N>","meaning":"concise stable identity and role"}. Never emit bare strings in subject_anchors and never reuse one subject id for a different entity."""
+CONTINUUM_PLAN_SYSTEM_PROMPT = """Plan one coherent MiniMax H3 Continuum sequence and return one JSON object with no Markdown fence or commentary. The application owns chunk count, time boundaries, public reference numbering, and output serialization; do not reproduce those values as bookkeeping fields. The global.sequence_preamble is the common Continuum prompt text that will be prepended verbatim to every logical chunk. It must contain only facts and instructions that truly persist across every chunk: stable subject identity and appearance, stable speaker/voice identity when vocalization recurs, persistent Reference Image or Video Reference roles, wardrobe/prop/environment/style continuity, genuinely global camera/lighting/audio rules, exclusions, and temporal-continuity constraints. Public Reference Images and <Video 1> are persistent when present. A public First Frame <Picture N> identity is opening-chunk-only in a multi-chunk sequence; a public Last Frame <Picture N> identity is final-chunk-only; neither may appear in the shared preamble unless the sequence has only one chunk. Driving Audio is persistent conditioning and owns no <Audio N> prompt tag. Do not place chunk-local action, dialogue, later-shot changes, or a final-frame target in the shared preamble when they do not apply to every chunk. Internal planning fields continuity_anchors and persistent_constraints are required text fields but may be empty when there is genuinely no additional sequence-wide planning fact or constraint beyond sequence_preamble and the chunk states; otherwise keep them compact and semantic. Each chunk's start/action/end state remains required non-empty semantic text rather than final-prompt meta. Preserve the user's explicit dialogue and lyrics verbatim, visible text verbatim, reference semantics, exclusions, camera rules, sound rules, and intended ending. Treat explicitly assigned reference roles as exclusive: do not transfer unrelated identity, clothing, setting, lighting, camera, motion, or audio traits from a source unless the user asks for them. Do not infer dialogue, lyrics, a transcript, or exact audio content from Driving Audio or any other conditioning that is not visible/audible to the prompt model. A later chunk continues from the previous end_state unless continuity is intentional_break. Use intentional_break only for a requested cut, location/time/wardrobe change, entrance/exit, camera reset, major framing change, or another deliberate discontinuity, and explain it in transition. Do not emit reference_assignments: Prompt Writer injects authoritative downstream H3 public reference identities. subject_anchors must be [] when no stable subject identity is needed; otherwise every entry is exactly {"id":"<Subject N>","meaning":"concise stable identity and role"}. Never emit bare strings in subject_anchors and never reuse one subject id for a different entity."""
 
 
 def _preflight_body_references(base_input: dict[str, Any], texts: list[str]) -> None:
@@ -587,6 +616,16 @@ def _nonempty_string(value: Any, field: str, *, chunk_index: int | None = None) 
     return value.strip()
 
 
+def _text_string(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ContinuumError(
+            "INVALID_CONTINUUM_PLAN",
+            f"Sequence-plan {field} must be text.",
+            {"field": field},
+        )
+    return value.strip()
+
+
 def _canonical_subject_id(value: Any) -> str:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return f"<Subject {value}>"
@@ -634,8 +673,8 @@ def validate_sequence_plan(
     global_plan = plan.get("global")
     if not isinstance(global_plan, dict):
         raise ContinuumError("INVALID_CONTINUUM_PLAN", "Sequence-plan global must be an object.")
-    continuity_anchors = _nonempty_string(global_plan.get("continuity_anchors"), "global.continuity_anchors")
-    persistent_constraints = _nonempty_string(global_plan.get("persistent_constraints"), "global.persistent_constraints")
+    continuity_anchors = _text_string(global_plan.get("continuity_anchors"), "global.continuity_anchors")
+    persistent_constraints = _text_string(global_plan.get("persistent_constraints"), "global.persistent_constraints")
     if schema_version == LEGACY_CONTINUUM_SCHEMA_VERSION:
         sequence_preamble = ""
     else:
@@ -866,16 +905,20 @@ def assemble_continuum_plan_repair_request(
             "role": "system",
             "name": "h3_continuum_sequence_plan_repair",
             "content": (
-                "Repair only the sequence-plan contract error described by the user. Preserve every valid creative "
-                "choice and return one complete JSON object with no Markdown fence or commentary. Follow the exact schema "
-                "from the original planning request. Do not add application-owned chunk indexes, time ranges, chunk-count "
-                "fields, or reference_assignments. subject_anchors must be [] or objects with exactly id and meaning."
+                "The reported contract error is the first validation failure, not necessarily the only invalid field. Audit the "
+                "complete sequence plan against the exact original schema and repair every contract violation required for "
+                "the whole object to validate in this one bounded repair pass. Preserve every already-valid creative choice "
+                "and change only invalid, missing, or structurally inconsistent contract fields. Check all required objects, "
+                "field types, required non-empty fields, chunk count and continuity values, subject anchors, public-reference "
+                "identity/scope, and application-owned field exclusions before returning one complete JSON object with no "
+                "Markdown fence or commentary. Do not add application-owned chunk indexes, time ranges, chunk-count fields, "
+                "or reference_assignments. subject_anchors must be [] or objects with exactly id and meaning."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Contract error: {error.message}\nDetails: {json.dumps(error.details, ensure_ascii=False)}\n\n"
+                f"First validation error: {error.message}\nDetails: {json.dumps(error.details, ensure_ascii=False)}\n\n"
                 f"Invalid plan:\n{invalid_text}\n\n"
                 f"Original planning request:\n{assembled['messages'][-1]['content']}"
             ),

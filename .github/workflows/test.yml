@@ -74,7 +74,7 @@ jobs:
           find web tests -type f \( -name '*.js' -o -name '*.mjs' \) -print0 | xargs -0 -n1 node --check
 
       - name: Run frontend regression suite
-        run: node --test tests/frontend_regressions.mjs
+        run: node --test tests/frontend_regressions.mjs tests/test_continuum_image_conveyor.mjs
 
   standalone-windows:
     name: Windows · standalone/build contracts
@@ -151,6 +151,42 @@ jobs:
           PYTHONPATH: tests/ci_stubs
           H3_CONTINUUM_SOURCE: ${{ github.workspace }}/.continuum-source
         run: python -m unittest discover -s tests -p "test_continuum*.py"
+
+  image-conveyor-contract:
+    name: Image Conveyor 1.7.2 · reviewed contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Prompt Writer
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out reviewed Image Conveyor source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI-Image-Conveyor
+          ref: e316cb028f21105a8ea303ace30d9d92acff6198
+          path: .image-conveyor-source
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run Prompt Writer cross-repository contract
+        env:
+          IMAGE_CONVEYOR_SOURCE: ${{ github.workspace }}/.image-conveyor-source
+        run: python -m unittest discover -s tests -p "test_image_conveyor_cross_repo.py"
+
+      - name: Run reviewed Image Conveyor topology suites
+        working-directory: .image-conveyor-source
+        run: node --test tests/test_reference_toggles.mjs tests/test_toggle_state_sync.mjs tests/test_queue_groups.mjs
 
   hygiene:
     name: Repository hygiene

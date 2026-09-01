@@ -13,6 +13,11 @@
 
 ### Reliability
 
+- Added first-class Image Conveyor compatibility for Continuum conditioning discovery, honoring persistent Reference Shelf population/output switches, Main/Last Frame switches, Queue execution-group size, the legacy node alias, and single-image transform/bypass chains instead of trusting visible wires alone.
+- Added opaque saved source fingerprints for persistent Image Conveyor Reference Shelf images so shelf replacements trigger Continuum source-drift protection without storing filenames; queue-group members remain intentionally dynamic. Legacy saved inventories without fingerprints are accepted once against otherwise identical topology and upgraded to the active fingerprint on successful refinement.
+- Added a pinned Image Conveyor 1.7.2 cross-repository CI contract alongside Prompt Writer's frontend coverage.
+- Relaxed Continuum's internal `continuity_anchors` and `persistent_constraints` to allow intentionally empty text while still requiring the fields and their types; they no longer abort otherwise valid plans with no extra sequence-wide metadata.
+- Changed the single bounded Continuum planner repair to audit and repair the complete schema contract rather than fixing only the first validation failure and exposing the next one.
 - Added deterministic structural sequence persistence without storing provider secrets.
 - Separated model-visible Prompt Writer media from downstream H3 conditioning identities. Workflow-only references can be declared without sending their pixels to the prompt model, and uploaded analysis media cannot silently impersonate a downstream `<Picture N>`.
 - Added explicit model-asset binding validation for future verified media reuse, rejecting missing, wrong-type, and duplicate bindings.
