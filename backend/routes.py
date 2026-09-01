@@ -24,6 +24,7 @@ from .continuum import (
     assemble_continuum_refinement,
     generation_target,
     parse_sequence_plan,
+    recover_sequence_plan_contract,
     persistent_reference_tags,
     sequence_reference_scopes,
     sequence_result,
@@ -672,6 +673,7 @@ async def _generate_continuum(
             chunks=settings["chunks"],
         )
         planner_repair_attempted = False
+        planner_contract_recovery_actions: list[str] = []
         try:
             plan = parse_sequence_plan(
                 planner_result["prompt"],
@@ -681,44 +683,76 @@ async def _generate_continuum(
                 chunk_reference_scopes=chunk_reference_scopes,
             )
         except ContinuumError as first_error:
-            planner_repair_attempted = True
-            stage.update({"kind": "plan_repair", "chunk": None})
-            repair_assembled = assemble_continuum_plan_repair_request(
-                body,
-                planner_result["prompt"],
-                first_error,
-            )
-            repair_runtime = await _preflight_sequence_stage(
-                body, model, backend, repair_assembled, request_id
-            )
-            repair_result = await _run_generation_stage(
-                body=body,
-                model=model,
-                backend=backend,
-                assembled=repair_assembled,
-                runtime_plan=repair_runtime,
-                seed=_sequence_seed(body.get("seed"), 1),
-                unload_after=False,
-                on_phase=on_phase,
-            )
-            stage_results.append(repair_result)
             try:
-                plan = parse_sequence_plan(
-                    repair_result["prompt"],
+                plan, planner_contract_recovery_actions = recover_sequence_plan_contract(
+                    planner_result["prompt"],
                     settings,
                     expected_references=expected_references,
                     persistent_references=persistent_references,
                     chunk_reference_scopes=chunk_reference_scopes,
                 )
-            except ContinuumError as second_error:
-                raise ModelError(
-                    second_error.code,
-                    "The sequence planner remained invalid after one bounded complete-contract repair.",
-                    {
-                        "initial_error": {"code": first_error.code, "message": first_error.message, "details": first_error.details},
-                        "repair_error": {"code": second_error.code, "message": second_error.message, "details": second_error.details},
-                    },
-                ) from second_error
+            except ContinuumError:
+                planner_repair_attempted = True
+                stage.update({"kind": "plan_repair", "chunk": None})
+                repair_assembled = assemble_continuum_plan_repair_request(
+                    body,
+                    planner_result["prompt"],
+                    first_error,
+                )
+                repair_runtime = await _preflight_sequence_stage(
+                    body, model, backend, repair_assembled, request_id
+                )
+                repair_result = await _run_generation_stage(
+                    body=body,
+                    model=model,
+                    backend=backend,
+                    assembled=repair_assembled,
+                    runtime_plan=repair_runtime,
+                    seed=_sequence_seed(body.get("seed"), 1),
+                    unload_after=False,
+                    on_phase=on_phase,
+                )
+                stage_results.append(repair_result)
+                try:
+                    plan = parse_sequence_plan(
+                        repair_result["prompt"],
+                        settings,
+                        expected_references=expected_references,
+                        persistent_references=persistent_references,
+                        chunk_reference_scopes=chunk_reference_scopes,
+                    )
+                except ContinuumError as second_error:
+                    try:
+                        plan, planner_contract_recovery_actions = recover_sequence_plan_contract(
+                            repair_result["prompt"],
+                            settings,
+                            expected_references=expected_references,
+                            persistent_references=persistent_references,
+                            chunk_reference_scopes=chunk_reference_scopes,
+                        )
+                    except ContinuumError as recovery_error:
+                        raise ModelError(
+                            second_error.code,
+                            "The sequence planner remained invalid after one bounded complete-contract repair "
+                            "and deterministic contract recovery.",
+                            {
+                                "initial_error": {
+                                    "code": first_error.code,
+                                    "message": first_error.message,
+                                    "details": first_error.details,
+                                },
+                                "repair_error": {
+                                    "code": second_error.code,
+                                    "message": second_error.message,
+                                    "details": second_error.details,
+                                },
+                                "recovery_error": {
+                                    "code": recovery_error.code,
+                                    "message": recovery_error.message,
+                                    "details": recovery_error.details,
+                                },
+                            },
+                        ) from recovery_error
 
         prompts: list[str] = []
         chunk_results: list[dict[str, Any]] = []
@@ -792,6 +826,8 @@ async def _generate_continuum(
             "prompt": sequence["prompt"],
             "sequence": sequence,
             "planner_repair_attempted": planner_repair_attempted,
+            "planner_contract_recovery_applied": bool(planner_contract_recovery_actions),
+            "planner_contract_recovery_actions": planner_contract_recovery_actions,
             "chunk_results": chunk_results,
             **metrics,
         }

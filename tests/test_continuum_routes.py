@@ -221,6 +221,7 @@ class ContinuumRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         payload = self.payload(response)
         self.assertFalse(payload["planner_repair_attempted"])
+        self.assertFalse(payload["planner_contract_recovery_applied"])
         self.assertEqual(payload["sequence"]["plan"]["global"]["continuity_anchors"], "")
         self.assertEqual(payload["sequence"]["plan"]["global"]["persistent_constraints"], "")
         self.assertEqual(stage.await_count, 3)
@@ -239,6 +240,72 @@ class ContinuumRouteTests(unittest.IsolatedAsyncioTestCase):
             [call.kwargs["unload_after"] for call in stage.await_args_list],
             [False, False, False, True],
         )
+
+    async def test_non_json_initial_then_empty_preamble_repair_recovers_without_third_model_call(self):
+        repaired = _plan()
+        repaired["global"]["sequence_preamble"] = ""
+        repaired["global"]["continuity_anchors"] = "Same subject, room, wardrobe, camera axis, light, and room tone."
+        repaired["global"]["persistent_constraints"] = "Preserve the requested continuity and exclusions."
+
+        response, stage, _backend = await self.run_sequence([
+            {"prompt": "not json at all"},
+            {"prompt": json.dumps(repaired)},
+            {"prompt": "Prompt one."},
+            {"prompt": "Prompt two."},
+        ])
+        self.assertEqual(response.status, 200)
+        payload = self.payload(response)
+        self.assertTrue(payload["planner_repair_attempted"])
+        self.assertTrue(payload["planner_contract_recovery_applied"])
+        self.assertIn("synthesized_sequence_preamble", payload["planner_contract_recovery_actions"])
+        self.assertEqual(stage.await_count, 4)
+        self.assertIn(
+            "Same subject, room, wardrobe, camera axis, light, and room tone.",
+            payload["sequence"]["preamble"],
+        )
+
+    async def test_wrapped_valid_initial_plan_is_recovered_without_spending_llm_repair(self):
+        wrapped = "Planner result follows:\n" + json.dumps(_plan()) + "\nEnd planner result."
+        response, stage, _backend = await self.run_sequence([
+            {"prompt": wrapped},
+            {"prompt": "Prompt one."},
+            {"prompt": "Prompt two."},
+        ])
+        self.assertEqual(response.status, 200)
+        payload = self.payload(response)
+        self.assertFalse(payload["planner_repair_attempted"])
+        self.assertTrue(payload["planner_contract_recovery_applied"])
+        self.assertEqual(payload["planner_contract_recovery_actions"], ["extracted_embedded_json"])
+        self.assertEqual(stage.await_count, 3)
+
+    async def test_llm_repair_survives_alphabetic_subject_aliases(self):
+        repaired = _plan()
+        repaired["global"]["subject_anchors"] = [
+            {"id": "<Subject A>", "meaning": "<Subject A> is the same courier throughout."}
+        ]
+        repaired["global"]["sequence_preamble"] += " Keep <Subject A> visually stable."
+        repaired["chunks"][0]["start_state"] = "<Subject A> begins by the door."
+        repaired["chunks"][1]["action"] = "<Subject A> crosses the room."
+
+        response, stage, _backend = await self.run_sequence([
+            {"prompt": "not json"},
+            {"prompt": json.dumps(repaired)},
+            {"prompt": "Prompt one."},
+            {"prompt": "Prompt two."},
+        ])
+        self.assertEqual(response.status, 200)
+        payload = self.payload(response)
+        self.assertTrue(payload["planner_repair_attempted"])
+        self.assertFalse(payload["planner_contract_recovery_applied"])
+        self.assertEqual(stage.await_count, 4)
+        normalized = payload["sequence"]["plan"]
+        self.assertEqual(
+            normalized["global"]["subject_anchors"],
+            [{"id": "<Subject 1>", "meaning": "<Subject 1> is the same courier throughout."}],
+        )
+        self.assertNotIn("<Subject A>", json.dumps(normalized))
+        self.assertIn("<Subject 1>", normalized["global"]["sequence_preamble"])
+        self.assertIn("<Subject 1>", normalized["chunks"][1]["action"])
 
     async def test_chunk_failure_reports_its_index_and_unloads_the_acquired_runtime(self):
         unload = AsyncMock()

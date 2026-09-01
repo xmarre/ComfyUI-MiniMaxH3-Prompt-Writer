@@ -19,6 +19,7 @@ from backend.continuum import (
     generation_target,
     parse_chunk_prompts,
     parse_sequence_plan,
+    recover_sequence_plan_contract,
     parse_timeline_sequence,
     prompt_hash,
     resolved_chunk_prompt,
@@ -743,7 +744,7 @@ class SequencePlanTests(unittest.TestCase):
         self.assertIn("<Picture 2>", validated["chunks"][2]["end_state"])
 
     def test_subject_ids_are_canonicalized_from_common_model_forms(self):
-        forms = ("<Subject 1>", "Subject 1", "subject 1", "S1", "subject_1", "1", 1)
+        forms = ("<Subject 1>", "<Subject A>", "Subject 1", "subject 1", "S1", "subject_1", "1", 1)
         for raw in forms:
             with self.subTest(raw=raw):
                 value = plan_v2()
@@ -755,6 +756,26 @@ class SequencePlanTests(unittest.TestCase):
                     validated["global"]["subject_anchors"],
                     [{"id": "<Subject 1>", "meaning": "The same courier throughout the sequence."}],
                 )
+
+    def test_alphabetic_subject_aliases_are_normalized_throughout_the_plan(self):
+        value = plan_v2()
+        value["global"]["sequence_preamble"] += " Keep <Subject A> visually stable."
+        value["global"]["continuity_anchors"] = "<Subject A> remains the same courier."
+        value["global"]["persistent_constraints"] = "Do not change <Subject A>'s coat."
+        value["global"]["subject_anchors"] = [
+            {"id": "<Subject A>", "meaning": "<Subject A> is the courier."}
+        ]
+        value["chunks"][0]["start_state"] = "<Subject A> waits by the door."
+        value["chunks"][1]["action"] = "<Subject A> crosses the room."
+        value["chunks"][2]["end_state"] = "<Subject A> stops at the window."
+        validated = validate_sequence_plan(value, settings(), expected_references=set())
+        serialized = json.dumps(validated)
+        self.assertNotIn("<Subject A>", serialized)
+        self.assertIn("<Subject 1>", serialized)
+        self.assertEqual(
+            validated["global"]["subject_anchors"],
+            [{"id": "<Subject 1>", "meaning": "<Subject 1> is the courier."}],
+        )
 
     def test_plan_rejects_subject_tag_not_declared_in_subject_anchors(self):
         value = plan_v2()
@@ -796,12 +817,77 @@ class SequencePlanTests(unittest.TestCase):
             validate_sequence_plan(value, settings(), expected_references=set())
         self.assertEqual(raised.exception.code, "INVALID_CONTINUUM_PLAN_CONTINUITY")
 
-    def test_json_fence_is_the_only_tolerated_wrapper(self):
+    def test_strict_parser_rejects_prose_wrapper_but_bounded_recovery_extracts_one_plan_object(self):
         payload = json.dumps(plan_v2())
         parsed = parse_sequence_plan(f"```json\n{payload}\n```", settings(), expected_references=set())
         self.assertEqual(parsed["global"]["sequence_preamble"], plan_v2()["global"]["sequence_preamble"])
+        wrapped = f"Here is the plan:\n{payload}\nDone."
         with self.assertRaises(ContinuumError):
-            parse_sequence_plan(f"Here is the plan:\n{payload}", settings(), expected_references=set())
+            parse_sequence_plan(wrapped, settings(), expected_references=set())
+        recovered, actions = recover_sequence_plan_contract(
+            wrapped,
+            settings(),
+            expected_references=set(),
+        )
+        self.assertEqual(recovered["global"]["sequence_preamble"], plan_v2()["global"]["sequence_preamble"])
+        self.assertEqual(actions, ["extracted_embedded_json"])
+
+    def test_bounded_recovery_synthesizes_only_from_global_semantics(self):
+        value = plan_v2()
+        value["global"]["sequence_preamble"] = ""
+        value["global"]["continuity_anchors"] = "Same courier, coat, hallway, and camera axis."
+        value["global"]["persistent_constraints"] = "Preserve the requested exclusions."
+        value["global"]["subject_anchors"] = [
+            {"id": "<Subject A>", "meaning": "<Subject A> remains the same courier."}
+        ]
+        value["chunks"][0]["action"] = "A chunk-local explosion occurs."
+        recovered, actions = recover_sequence_plan_contract(
+            json.dumps(value),
+            settings(),
+            expected_references=set(),
+        )
+        self.assertIn("synthesized_sequence_preamble", actions)
+        preamble = recovered["global"]["sequence_preamble"]
+        self.assertIn("<Subject 1> remains the same courier.", preamble)
+        self.assertIn("Same courier, coat, hallway, and camera axis.", preamble)
+        self.assertIn("Preserve the requested exclusions.", preamble)
+        self.assertNotIn("explosion", preamble.lower())
+
+    def test_bounded_recovery_defaults_optional_internal_text_and_strips_application_fields(self):
+        value = plan_v2()
+        value["global"]["sequence_preamble"] = ""
+        value["global"]["continuity_anchors"] = None
+        value["global"]["persistent_constraints"] = None
+        value["global"]["subject_anchors"] = None
+        value["global"]["reference_assignments"] = [{"tag": "<Picture 99>", "role": "wrong"}]
+        for index, chunk in enumerate(value["chunks"], start=1):
+            chunk["index"] = index
+        recovered, actions = recover_sequence_plan_contract(
+            json.dumps(value),
+            settings(),
+            expected_references=set(),
+        )
+        self.assertEqual(recovered["global"]["continuity_anchors"], "")
+        self.assertEqual(recovered["global"]["persistent_constraints"], "")
+        self.assertEqual(recovered["global"]["subject_anchors"], [])
+        self.assertEqual(recovered["global"]["reference_assignments"], [])
+        self.assertTrue(recovered["global"]["sequence_preamble"])
+        self.assertIn("defaulted_continuity_anchors", actions)
+        self.assertIn("defaulted_persistent_constraints", actions)
+        self.assertIn("defaulted_subject_anchors", actions)
+        self.assertIn("removed_reference_assignments", actions)
+        self.assertIn("removed_chunk_indexes", actions)
+
+    def test_bounded_recovery_does_not_invent_missing_chunk_semantics(self):
+        value = plan_v2()
+        value["chunks"][1]["action"] = ""
+        with self.assertRaises(ContinuumError) as raised:
+            recover_sequence_plan_contract(
+                json.dumps(value),
+                settings(),
+                expected_references=set(),
+            )
+        self.assertEqual(raised.exception.details["field"], "action")
 
 
 class CanonicalTimelineTests(unittest.TestCase):
@@ -984,11 +1070,18 @@ class ContinuumAssemblyTests(unittest.TestCase):
         with patch("backend.assembly.STORE.manifest", return_value=manifest()):
             assembled = assemble_continuum_plan_repair_request(body(), "{bad", error)
         system = assembled["messages"][0]["content"]
+        self.assertIn("global.sequence_preamble is the common Continuum prompt text", system)
+        self.assertIn("Driving Audio is persistent conditioning", system)
         self.assertIn("first validation failure", system)
         self.assertIn("repair every contract violation", system)
         self.assertIn("whole object to validate", system)
+        self.assertIn("required non-empty global.sequence_preamble", system)
+        self.assertIn("canonical positive numeric IDs such as <Subject 1>", system)
+        self.assertIn("never alphabetic IDs such as <Subject A>", system)
         self.assertIn("Do not add application-owned chunk indexes", system)
-        self.assertIn("First validation error: Bad shape.", assembled["messages"][1]["content"])
+        user = assembled["messages"][1]["content"]
+        self.assertIn("First validation error: Bad shape.", user)
+        self.assertIn("Repair the whole object, not only that field.", user)
 
     def test_generated_chunk_rejects_subject_when_plan_declares_no_subjects(self):
         request = body()

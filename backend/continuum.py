@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+import copy
 import hashlib
 import json
 import re
@@ -31,6 +32,7 @@ _TIMELINE_HEADER = re.compile(
 )
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.IGNORECASE | re.DOTALL)
 _SUBJECT_TAG = re.compile(r"<\s*Subject\s+(\d+)\s*>", re.IGNORECASE)
+_SUBJECT_ALPHA_ALIAS_TAG = re.compile(r"<\s*Subject\s+([A-Z])\s*>", re.IGNORECASE)
 _CONTINUUM_STANDALONE_FIELD = re.compile(
     r"^\s*(integrated_multimodal_description|subject_definitions|summary|retention_analysis|"
     r"detailed_description|overall_soundscape|non_diegetic_music)\s*:",
@@ -54,6 +56,17 @@ def subject_tags(text: str) -> set[str]:
         for number in _SUBJECT_TAG.findall(str(text))
         if int(number) > 0
     }
+
+
+def _subject_alpha_alias_number(value: str) -> int:
+    return ord(value.upper()) - ord("A") + 1
+
+
+def _normalize_plan_subject_aliases(value: str) -> str:
+    return _SUBJECT_ALPHA_ALIAS_TAG.sub(
+        lambda match: f"<Subject {_subject_alpha_alias_number(match.group(1))}>",
+        str(value),
+    )
 
 
 def continuum_chunk_format_violations(
@@ -513,7 +526,7 @@ def _planner_schema(settings: dict[str, Any]) -> str:
     )
 
 
-CONTINUUM_PLAN_SYSTEM_PROMPT = """Plan one coherent MiniMax H3 Continuum sequence and return one JSON object with no Markdown fence or commentary. The application owns chunk count, time boundaries, public reference numbering, and output serialization; do not reproduce those values as bookkeeping fields. The global.sequence_preamble is the common Continuum prompt text that will be prepended verbatim to every logical chunk. It must contain only facts and instructions that truly persist across every chunk: stable subject identity and appearance, stable speaker/voice identity when vocalization recurs, persistent Reference Image or Video Reference roles, wardrobe/prop/environment/style continuity, genuinely global camera/lighting/audio rules, exclusions, and temporal-continuity constraints. Public Reference Images and <Video 1> are persistent when present. A public First Frame <Picture N> identity is opening-chunk-only in a multi-chunk sequence; a public Last Frame <Picture N> identity is final-chunk-only; neither may appear in the shared preamble unless the sequence has only one chunk. Driving Audio is persistent conditioning and owns no <Audio N> prompt tag. Do not place chunk-local action, dialogue, later-shot changes, or a final-frame target in the shared preamble when they do not apply to every chunk. Internal planning fields continuity_anchors and persistent_constraints are required text fields but may be empty when there is genuinely no additional sequence-wide planning fact or constraint beyond sequence_preamble and the chunk states; otherwise keep them compact and semantic. Each chunk's start/action/end state remains required non-empty semantic text rather than final-prompt meta. Preserve the user's explicit dialogue and lyrics verbatim, visible text verbatim, reference semantics, exclusions, camera rules, sound rules, and intended ending. Treat explicitly assigned reference roles as exclusive: do not transfer unrelated identity, clothing, setting, lighting, camera, motion, or audio traits from a source unless the user asks for them. Do not infer dialogue, lyrics, a transcript, or exact audio content from Driving Audio or any other conditioning that is not visible/audible to the prompt model. A later chunk continues from the previous end_state unless continuity is intentional_break. Use intentional_break only for a requested cut, location/time/wardrobe change, entrance/exit, camera reset, major framing change, or another deliberate discontinuity, and explain it in transition. Do not emit reference_assignments: Prompt Writer injects authoritative downstream H3 public reference identities. subject_anchors must be [] when no stable subject identity is needed; otherwise every entry is exactly {"id":"<Subject N>","meaning":"concise stable identity and role"}. Never emit bare strings in subject_anchors and never reuse one subject id for a different entity."""
+CONTINUUM_PLAN_SYSTEM_PROMPT = """Plan one coherent MiniMax H3 Continuum sequence and return one JSON object with no Markdown fence or commentary. The application owns chunk count, time boundaries, public reference numbering, and output serialization; do not reproduce those values as bookkeeping fields. The global.sequence_preamble is the common Continuum prompt text that will be prepended verbatim to every logical chunk. It must contain only facts and instructions that truly persist across every chunk: stable subject identity and appearance, stable speaker/voice identity when vocalization recurs, persistent Reference Image or Video Reference roles, wardrobe/prop/environment/style continuity, genuinely global camera/lighting/audio rules, exclusions, and temporal-continuity constraints. Public Reference Images and <Video 1> are persistent when present. A public First Frame <Picture N> identity is opening-chunk-only in a multi-chunk sequence; a public Last Frame <Picture N> identity is final-chunk-only; neither may appear in the shared preamble unless the sequence has only one chunk. Driving Audio is persistent conditioning and owns no <Audio N> prompt tag. Do not place chunk-local action, dialogue, later-shot changes, or a final-frame target in the shared preamble when they do not apply to every chunk. Internal planning fields continuity_anchors and persistent_constraints are required text fields but may be empty when there is genuinely no additional sequence-wide planning fact or constraint beyond sequence_preamble and the chunk states; otherwise keep them compact and semantic. Each chunk's start/action/end state remains required non-empty semantic text rather than final-prompt meta. Preserve the user's explicit dialogue and lyrics verbatim, visible text verbatim, reference semantics, exclusions, camera rules, sound rules, and intended ending. Treat explicitly assigned reference roles as exclusive: do not transfer unrelated identity, clothing, setting, lighting, camera, motion, or audio traits from a source unless the user asks for them. Do not infer dialogue, lyrics, a transcript, or exact audio content from Driving Audio or any other conditioning that is not visible/audible to the prompt model. A later chunk continues from the previous end_state unless continuity is intentional_break. Use intentional_break only for a requested cut, location/time/wardrobe change, entrance/exit, camera reset, major framing change, or another deliberate discontinuity, and explain it in transition. Do not emit reference_assignments: Prompt Writer injects authoritative downstream H3 public reference identities. subject_anchors must be [] when no stable subject identity is needed; otherwise every entry is exactly {"id":"<Subject N>","meaning":"concise stable identity and role"}. Never emit bare strings in subject_anchors and never reuse one subject id for a different entity. Before returning, silently verify the complete JSON contract: global.sequence_preamble is non-empty polished prompt prose; continuity_anchors and persistent_constraints are text; subject_anchors is [] or uses positive numeric IDs exactly like <Subject 1>, <Subject 2>; the chunk array has the exact requested length; Chunk 1 continuity is initial; later continuity is continuous or intentional_break with a non-empty transition; every start_state/action/end_state is non-empty; and no application-owned index, time, chunk-count, or reference_assignments field is present."""
 
 
 def _preflight_body_references(base_input: dict[str, Any], texts: list[str]) -> None:
@@ -621,6 +634,150 @@ def _json_object(text: str) -> dict[str, Any]:
     return parsed
 
 
+def _embedded_plan_json_object(text: str) -> dict[str, Any] | None:
+    value = str(text or "").strip()
+    if not value:
+        return None
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for offset, char in enumerate(value):
+        if char != "{":
+            continue
+        try:
+            parsed, consumed = decoder.raw_decode(value[offset:])
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(parsed, dict)
+            and isinstance(parsed.get("global"), dict)
+            and isinstance(parsed.get("chunks"), list)
+        ):
+            candidates.append((offset, offset + consumed, parsed))
+    unique_spans = {(start, end) for start, end, _parsed in candidates}
+    if len(unique_spans) != 1:
+        return None
+    return candidates[0][2]
+
+
+def _punctuated_sentence(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    return text if text[-1] in ".!?" else text + "."
+
+
+def _fallback_sequence_preamble(
+    global_plan: dict[str, Any],
+    *,
+    persistent_references: set[str],
+) -> str:
+    parts: list[str] = []
+    subjects = global_plan.get("subject_anchors")
+    if isinstance(subjects, list):
+        for subject in subjects:
+            if not isinstance(subject, dict):
+                continue
+            meaning = subject.get("meaning")
+            if isinstance(meaning, str) and meaning.strip():
+                parts.append(meaning.strip())
+    for field in ("continuity_anchors", "persistent_constraints"):
+        value = global_plan.get(field)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    if persistent_references:
+        tags = ", ".join(sorted(persistent_references))
+        parts.append(
+            f"Persistent reference identities {tags} retain their established roles throughout the sequence"
+        )
+
+    rendered: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        sentence = _punctuated_sentence(part)
+        key = sentence.casefold()
+        if sentence and key not in seen:
+            rendered.append(sentence)
+            seen.add(key)
+    if rendered:
+        return " ".join(rendered)
+    return (
+        "Maintain coherent visual and temporal continuity across the sequence while preserving only established "
+        "persistent details and honoring any intentional transition."
+    )
+
+
+def recover_sequence_plan_contract(
+    text: str,
+    settings: dict[str, Any],
+    *,
+    expected_references: set[str],
+    persistent_references: set[str] | None = None,
+    chunk_reference_scopes: list[set[str]] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    actions: list[str] = []
+    try:
+        raw_plan = _json_object(text)
+    except ContinuumError as strict_json_error:
+        raw_plan = _embedded_plan_json_object(text)
+        if raw_plan is None:
+            raise strict_json_error
+        actions.append("extracted_embedded_json")
+
+    candidate = copy.deepcopy(raw_plan)
+    if candidate.get("schema_version") != CONTINUUM_SCHEMA_VERSION:
+        return (
+            validate_sequence_plan(
+                candidate,
+                settings,
+                expected_references=expected_references,
+                persistent_references=persistent_references,
+                chunk_reference_scopes=chunk_reference_scopes,
+                allow_legacy=False,
+            ),
+            actions,
+        )
+
+    global_plan = candidate.get("global")
+    if isinstance(global_plan, dict):
+        for field in ("continuity_anchors", "persistent_constraints"):
+            if global_plan.get(field) is None:
+                global_plan[field] = ""
+                actions.append(f"defaulted_{field}")
+        if global_plan.get("subject_anchors") is None:
+            global_plan["subject_anchors"] = []
+            actions.append("defaulted_subject_anchors")
+        if "reference_assignments" in global_plan:
+            global_plan.pop("reference_assignments", None)
+            actions.append("removed_reference_assignments")
+        sequence_preamble = global_plan.get("sequence_preamble")
+        if not isinstance(sequence_preamble, str) or not sequence_preamble.strip():
+            global_plan["sequence_preamble"] = _fallback_sequence_preamble(
+                global_plan,
+                persistent_references=set(persistent_references or set()),
+            )
+            actions.append("synthesized_sequence_preamble")
+
+    chunks = candidate.get("chunks")
+    if isinstance(chunks, list):
+        removed_index = False
+        for chunk in chunks:
+            if isinstance(chunk, dict) and "index" in chunk:
+                chunk.pop("index", None)
+                removed_index = True
+        if removed_index:
+            actions.append("removed_chunk_indexes")
+
+    normalized = validate_sequence_plan(
+        candidate,
+        settings,
+        expected_references=expected_references,
+        persistent_references=persistent_references,
+        chunk_reference_scopes=chunk_reference_scopes,
+        allow_legacy=False,
+    )
+    return normalized, actions
+
+
 def _nonempty_string(value: Any, field: str, *, chunk_index: int | None = None) -> str:
     if not isinstance(value, str) or not value.strip():
         details = {"field": field}
@@ -650,6 +807,9 @@ def _canonical_subject_id(value: Any) -> str:
             {"field": "subject_anchors.id"},
         )
     raw = value.strip()
+    alias_match = _SUBJECT_ALPHA_ALIAS_TAG.fullmatch(raw)
+    if alias_match:
+        return f"<Subject {_subject_alpha_alias_number(alias_match.group(1))}>"
     patterns = (
         r"<\s*Subject\s+([1-9]\d*)\s*>",
         r"Subject\s+([1-9]\d*)",
@@ -663,7 +823,10 @@ def _canonical_subject_id(value: Any) -> str:
     raise ContinuumError(
         "INVALID_CONTINUUM_PLAN",
         f"Invalid stable subject id: {raw}.",
-        {"field": "subject_anchors.id"},
+        {
+            "field": "subject_anchors.id",
+            "expected": "<Subject N> with a positive numeric N",
+        },
     )
 
 
@@ -687,12 +850,18 @@ def validate_sequence_plan(
     global_plan = plan.get("global")
     if not isinstance(global_plan, dict):
         raise ContinuumError("INVALID_CONTINUUM_PLAN", "Sequence-plan global must be an object.")
-    continuity_anchors = _text_string(global_plan.get("continuity_anchors"), "global.continuity_anchors")
-    persistent_constraints = _text_string(global_plan.get("persistent_constraints"), "global.persistent_constraints")
+    continuity_anchors = _normalize_plan_subject_aliases(
+        _text_string(global_plan.get("continuity_anchors"), "global.continuity_anchors")
+    )
+    persistent_constraints = _normalize_plan_subject_aliases(
+        _text_string(global_plan.get("persistent_constraints"), "global.persistent_constraints")
+    )
     if schema_version == LEGACY_CONTINUUM_SCHEMA_VERSION:
         sequence_preamble = ""
     else:
-        sequence_preamble = _nonempty_string(global_plan.get("sequence_preamble"), "global.sequence_preamble")
+        sequence_preamble = _normalize_plan_subject_aliases(
+            _nonempty_string(global_plan.get("sequence_preamble"), "global.sequence_preamble")
+        )
         if _contains_reserved_sequence_header(sequence_preamble):
             raise ContinuumError(
                 "INVALID_CONTINUUM_PLAN",
@@ -715,7 +884,9 @@ def validate_sequence_plan(
         if not isinstance(subject, dict):
             raise ContinuumError("INVALID_CONTINUUM_PLAN", "Every subject anchor must be an object.")
         canonical_id = _canonical_subject_id(subject.get("id"))
-        meaning = _nonempty_string(subject.get("meaning"), "subject_anchors.meaning")
+        meaning = _normalize_plan_subject_aliases(
+            _nonempty_string(subject.get("meaning"), "subject_anchors.meaning")
+        )
         if canonical_id in seen_subjects:
             raise ContinuumError("INVALID_CONTINUUM_PLAN", f"Sequence plan defines {canonical_id} more than once.")
         seen_subjects.add(canonical_id)
@@ -777,7 +948,7 @@ def validate_sequence_plan(
         transition = chunk.get("transition", "")
         if not isinstance(transition, str):
             raise ContinuumError("INVALID_CONTINUUM_PLAN", f"Chunk {index} transition must be text.")
-        transition = transition.strip()
+        transition = _normalize_plan_subject_aliases(transition.strip())
         if continuity == "intentional_break" and not transition:
             raise ContinuumError(
                 "INVALID_CONTINUUM_PLAN_CONTINUITY",
@@ -787,9 +958,15 @@ def validate_sequence_plan(
             "index": index,
             "continuity": continuity,
             "transition": transition,
-            "start_state": _nonempty_string(chunk.get("start_state"), "start_state", chunk_index=index),
-            "action": _nonempty_string(chunk.get("action"), "action", chunk_index=index),
-            "end_state": _nonempty_string(chunk.get("end_state"), "end_state", chunk_index=index),
+            "start_state": _normalize_plan_subject_aliases(
+                _nonempty_string(chunk.get("start_state"), "start_state", chunk_index=index)
+            ),
+            "action": _normalize_plan_subject_aliases(
+                _nonempty_string(chunk.get("action"), "action", chunk_index=index)
+            ),
+            "end_state": _normalize_plan_subject_aliases(
+                _nonempty_string(chunk.get("end_state"), "end_state", chunk_index=index)
+            ),
         }
         normalized_chunks.append(normalized_chunk)
         references_for_chunk: set[str] = set()
@@ -919,20 +1096,27 @@ def assemble_continuum_plan_repair_request(
             "role": "system",
             "name": "h3_continuum_sequence_plan_repair",
             "content": (
-                "The reported contract error is the first validation failure, not necessarily the only invalid field. Audit the "
-                "complete sequence plan against the exact original schema and repair every contract violation required for "
-                "the whole object to validate in this one bounded repair pass. Preserve every already-valid creative choice "
-                "and change only invalid, missing, or structurally inconsistent contract fields. Check all required objects, "
-                "field types, required non-empty fields, chunk count and continuity values, subject anchors, public-reference "
-                "identity/scope, and application-owned field exclusions before returning one complete JSON object with no "
-                "Markdown fence or commentary. Do not add application-owned chunk indexes, time ranges, chunk-count fields, "
-                "or reference_assignments. subject_anchors must be [] or objects with exactly id and meaning."
+                CONTINUUM_PLAN_SYSTEM_PROMPT
+                + "\n\nREPAIR MODE — COMPLETE CONTRACT AUDIT: The reported contract error is the first validation "
+                "failure, not necessarily the only invalid field. Audit the complete sequence plan against the exact "
+                "original schema and repair every contract violation required for the whole object to validate in this "
+                "one bounded repair pass. Preserve every already-valid creative choice and change only invalid, missing, "
+                "or structurally inconsistent contract fields. Re-check all required objects, field types, the required "
+                "non-empty global.sequence_preamble, exact chunk count and continuity values, subject anchors, public-"
+                "reference identity/scope, and application-owned field exclusions before returning one complete JSON "
+                "object with no Markdown fence or commentary. Do not add application-owned chunk indexes, time ranges, "
+                "chunk-count fields, or reference_assignments. subject_anchors must be [] or objects with exactly id and "
+                "meaning; return canonical positive numeric IDs such as <Subject 1> and <Subject 2>, never alphabetic IDs "
+                "such as <Subject A>. Do not preserve malformed contract syntax merely because its creative meaning is "
+                "otherwise valid."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"First validation error: {error.message}\nDetails: {json.dumps(error.details, ensure_ascii=False)}\n\n"
+                "Repair the whole object, not only that field. The returned global.sequence_preamble must be non-empty, "
+                "and every stable subject ID must be canonical numeric <Subject N>.\n\n"
                 f"Invalid plan:\n{invalid_text}\n\n"
                 f"Original planning request:\n{assembled['messages'][-1]['content']}"
             ),
