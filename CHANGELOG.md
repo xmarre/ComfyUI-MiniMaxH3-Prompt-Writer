@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Added H3 Continuum as a separate video output target with native 1–16 chunk and 4–15 second controls.
+- Added validated continuity planning followed by sequential chunk-local H3 prompt generation and canonical Continuum Timeline serialization with one shared sequence-wide H3 preamble.
+- Added deterministic integer and fractional Timeline boundaries and strict Writer-side validation instead of relying on Continuum's Fixed fallback.
+- Added chunk-local refinement that preserves the shared preamble and every unchanged chunk body byte-for-byte, with hashes computed from the exact resolved prompts Continuum receives.
+- Added an explicit graph handoff for H3 Continuum Sampler V3.4 with unambiguous sampler selection, **Prompt Format = Timeline** compatibility, settings mismatch review, connected Text (Multiline) updates, and clipboard fallback.
+- Added downstream V3.4 conditioning discovery with exact public identity rules: Reference Images own compact `<Picture N>` numbering in hybrid runs; keyframe-only First/Last inputs own temporal Picture identities; Video Reference is persistent `<Video 1>`; Driving Audio remains untagged.
+
+### Reliability
+
+- Added deterministic structural sequence persistence without storing provider secrets.
+- Separated model-visible Prompt Writer media from downstream H3 conditioning identities. Workflow-only references can be declared without sending their pixels to the prompt model, and uploaded analysis media cannot silently impersonate a downstream `<Picture N>`.
+- Added explicit model-asset binding validation for future verified media reuse, rejecting missing, wrong-type, and duplicate bindings.
+- Added cross-repository CI that checks Writer Timeline output against the current H3 Continuum `v2/prompts.py` parser and verifies exact resolved prompts and SHA-256 hashes.
+- Added sequence progress, cancellation, exact chunk-failure reporting, bounded one-shot plan repair, chunk-scoped reference validation with a narrow Continuum-only correction pass, final-stage unload behavior, and cumulative provider accounting.
+- Added temporal-mode validation against the selected V3.4 First/Last Frame wiring and blocked generation, refinement, or handoff when the selected mode does not match the active keyframe topology.
+- Added saved downstream-conditioning snapshots so later refinement and graph handoff reject observable source rewiring that would silently reuse the same public reference tags for different workflow inputs.
+- Added native Continuum chunk-body validation for repeated shared preambles, standalone H3 field/shot wrappers, nested Timeline headers, keyframe-alignment boilerplate, and undeclared subject identities.
+- Made **Sync settings & apply** transactional: Writer now resolves the editable Sequence Prompt target before mutation and restores sampler/text widget values if a graph callback fails.
+- Fixed Continuum draft persistence after the schema-v2 contract rework: saved sequences now retain their shared preamble and downstream-conditioning snapshot, while legacy schema-v1 drafts migrate to v2 on save/load.
+- Restricted legacy `[Chunk N]` migration to genuinely legacy saved sequences so schema-v2 Timeline drafts cannot silently discard their shared preamble.
+
 ## 0.4.3 - 2026-08-29
 
 ### Features
