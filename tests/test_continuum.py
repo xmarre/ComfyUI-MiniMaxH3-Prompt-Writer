@@ -318,6 +318,37 @@ class DownstreamReferenceInventoryTests(unittest.TestCase):
             validate_saved_downstream_inventory(same, no_fingerprint)
         self.assertEqual(raised.exception.code, "CONTINUUM_REFERENCE_SOURCE_DRIFT")
 
+    def test_model_visible_source_can_be_rematerialized_under_a_new_temporary_asset_id(self):
+        saved = downstream_inventory(1)
+        saved["items"][0].update({
+            "source_identity": "image-conveyor-ref-v1:1111111111111111",
+            "visible_to_model": True,
+            "model_asset_id": "old-session-asset",
+        })
+        active = copy.deepcopy(saved)
+        active["items"][0]["model_asset_id"] = "new-session-asset"
+
+        upgraded = validate_saved_downstream_inventory(saved, active)
+        self.assertEqual(upgraded["items"][0]["model_asset_id"], "new-session-asset")
+
+        missing = copy.deepcopy(active)
+        missing["items"][0]["visible_to_model"] = False
+        missing["items"][0].pop("model_asset_id")
+        with self.assertRaises(ContinuumError) as raised:
+            validate_saved_downstream_inventory(saved, missing)
+        self.assertEqual(raised.exception.code, "CONTINUUM_REFERENCE_SOURCE_DRIFT")
+
+        unfingerprinted_saved = downstream_inventory(1)
+        unfingerprinted_saved["items"][0].update({
+            "visible_to_model": True,
+            "model_asset_id": "old-session-asset",
+        })
+        unfingerprinted_active = copy.deepcopy(unfingerprinted_saved)
+        unfingerprinted_active["items"][0]["model_asset_id"] = "new-session-asset"
+        with self.assertRaises(ContinuumError) as raised:
+            validate_saved_downstream_inventory(unfingerprinted_saved, unfingerprinted_active)
+        self.assertEqual(raised.exception.code, "CONTINUUM_REFERENCE_SOURCE_DRIFT")
+
     def test_gapped_public_picture_numbers_are_rejected(self):
         value = downstream_inventory(2)
         value["items"][1]["tag"] = "<Picture 3>"

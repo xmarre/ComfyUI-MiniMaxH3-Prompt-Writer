@@ -5,8 +5,11 @@ import test from "node:test";
 const continuumSource = await readFile(new URL("../web/continuum.js", import.meta.url), "utf8");
 const continuumEncoded = Buffer.from(continuumSource).toString("base64");
 const {
+  bindContinuumReferenceMedia,
   discoverContinuumReferenceInventory,
+  discoverContinuumWorkflowImageMedia,
   sameContinuumReferenceInventory,
+  sameContinuumWorkflowSourceInventory,
   validateContinuumModeTopology,
 } = await import(`data:text/javascript;base64,${continuumEncoded}`);
 
@@ -307,6 +310,130 @@ test("non-Conveyor image sources retain ordinary wire-based discovery", () => {
   assert.equal(inventory.items.length, 1);
   assert.equal(inventory.items[0].tag, "<Picture 1>");
   assert.equal(inventory.items[0].source_node_class, "LoadImage");
+});
+
+test("persistent active Conveyor Reference Shelf slots expose importable Writer media descriptors", () => {
+  const sampler = samplerNode();
+  const conveyor = conveyorNode({
+    referenceSlots: [ref("one"), ...Array(7).fill(null)],
+  });
+  const { app, connect } = graphWith([sampler, conveyor]);
+  connect(conveyor, 6, sampler, "reference_image_3");
+
+  const discovered = discoverContinuumWorkflowImageMedia(app, sampler);
+  assert.equal(discovered.candidates.length, 1);
+  assert.deepEqual(
+    {
+      label: discovered.candidates[0].label,
+      input_name: discovered.candidates[0].input_name,
+      importable: discovered.candidates[0].importable,
+      source_kind: discovered.candidates[0].source_kind,
+      file: discovered.candidates[0].file,
+    },
+    {
+      label: "<Picture 1>",
+      input_name: "reference_image_3",
+      importable: true,
+      source_kind: "image_conveyor_persistent",
+      file: { filename: "one.png", subfolder: "", type: "input" },
+    },
+  );
+});
+
+test("queue-group workflow image slots are visible in the UI contract but cannot be falsely materialized as stable files", () => {
+  const sampler = samplerNode();
+  const conveyor = conveyorNode({ outputMode: "queue_group", imagesPerExecution: 2 });
+  const { app, connect } = graphWith([sampler, conveyor]);
+  connect(conveyor, 6, sampler, "reference_image_1");
+
+  const candidate = discoverContinuumWorkflowImageMedia(app, sampler).candidates[0];
+  assert.equal(candidate.label, "<Picture 1>");
+  assert.equal(candidate.importable, false);
+  assert.equal(candidate.reason, "dynamic_queue_group");
+});
+
+test("processed Conveyor reference chains remain active conditioning but refuse an inexact pre-execution media copy", () => {
+  const sampler = samplerNode();
+  const conveyor = conveyorNode({
+    referenceSlots: [ref("one"), ...Array(7).fill(null)],
+  });
+  const transform = transformNode();
+  const { app, connect } = graphWith([sampler, conveyor, transform]);
+  connect(conveyor, 6, transform, "image");
+  connect(transform, 0, sampler, "reference_image_1");
+
+  const candidate = discoverContinuumWorkflowImageMedia(app, sampler).candidates[0];
+  assert.equal(candidate.importable, false);
+  assert.equal(candidate.reason, "processed_image_chain");
+});
+
+test("direct LoadImage workflow references can be imported from their selected ComfyUI input file", () => {
+  const sampler = samplerNode();
+  const loader = {
+    id: 51,
+    type: "LoadImage",
+    inputs: [],
+    outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+    widgets: [{ name: "image", value: "characters/alice.png" }],
+  };
+  const { app, connect } = graphWith([sampler, loader]);
+  connect(loader, 0, sampler, "reference_image_1");
+
+  const discovered = discoverContinuumWorkflowImageMedia(app, sampler);
+  assert.equal(discovered.candidates[0].importable, true);
+  assert.deepEqual(discovered.candidates[0].file, {
+    filename: "alice.png",
+    subfolder: "characters",
+    type: "input",
+  });
+  assert.match(discovered.inventory.items[0].source_identity, /^load-image-v1:[0-9a-f]{16}$/);
+});
+
+test("bound workflow media makes exactly the matching active source visible to the prompt model", () => {
+  const sampler = samplerNode();
+  const conveyor = conveyorNode({
+    referenceSlots: [ref("one"), ...Array(7).fill(null)],
+  });
+  const { app, connect } = graphWith([sampler, conveyor]);
+  connect(conveyor, 6, sampler, "reference_image_1");
+
+  const discovered = discoverContinuumWorkflowImageMedia(app, sampler);
+  const candidate = discovered.candidates[0];
+  const bindings = {
+    [candidate.key]: {
+      asset_id: "asset-1",
+      source_identity: candidate.source_identity,
+    },
+  };
+  const bound = bindContinuumReferenceMedia(discovered.inventory, bindings, [{ id: "asset-1" }]);
+  assert.equal(bound.items[0].visible_to_model, true);
+  assert.equal(bound.items[0].model_asset_id, "asset-1");
+
+  bindings[candidate.key].source_identity = "image-conveyor-ref-v1:ffffffffffffffff";
+  const stale = bindContinuumReferenceMedia(discovered.inventory, bindings, [{ id: "asset-1" }]);
+  assert.equal(stale.items[0].visible_to_model, false);
+  assert.equal(Object.hasOwn(stale.items[0], "model_asset_id"), false);
+});
+
+test("Apply-to-Continuum source comparison ignores Prompt Writer media binding while preserving workflow source drift", () => {
+  const sampler = samplerNode();
+  const conveyor = conveyorNode({
+    referenceSlots: [ref("one"), ...Array(7).fill(null)],
+  });
+  const { app, connect } = graphWith([sampler, conveyor]);
+  connect(conveyor, 6, sampler, "reference_image_1");
+
+  const active = discoverContinuumReferenceInventory(app, sampler);
+  const saved = structuredClone(active);
+  saved.items[0].visible_to_model = true;
+  saved.items[0].model_asset_id = "asset-1";
+
+  assert.equal(sameContinuumReferenceInventory(saved, active), false);
+  assert.equal(sameContinuumWorkflowSourceInventory(saved, active), true);
+
+  const changed = structuredClone(active);
+  changed.items[0].source_identity = "image-conveyor-ref-v1:ffffffffffffffff";
+  assert.equal(sameContinuumWorkflowSourceInventory(saved, changed), false);
 });
 
 test("unreadable Image Conveyor state fails closed instead of inventing public identities", () => {

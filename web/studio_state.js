@@ -110,7 +110,7 @@ function safeContinuumInventory(value) {
       source: raw.source,
       visible_to_model: raw.visible_to_model,
     };
-    for (const field of ["tag", "input_name", "source_node_class", "source_output_name", "model_asset_id"]) {
+    for (const field of ["tag", "input_name", "source_node_class", "source_output_name", "source_identity", "model_asset_id"]) {
       if (raw[field] != null) {
         if (typeof raw[field] !== "string" || raw[field].length > 512) {
           return { valid: false, value: null };
@@ -613,6 +613,8 @@ export function createStudioState({ sessionId, storage = globalThis.localStorage
     generationDotCount: 0,
     sessionId,
     assets: [],
+    workflowReferenceBindings: {},
+    workflowReferenceImportBusy: false,
     previewAssetId: null,
     audioSupported: false,
     models: [],

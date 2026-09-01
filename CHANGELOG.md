@@ -13,6 +13,10 @@
 
 ### Reliability
 
+- Added the missing **Active workflow images** UI for Reference + H3 Continuum, including **Add active workflow refs**, per-slot Add/Update state, ComfyUI image materialization for stable Image Conveyor Reference Shelf and direct Load Image sources, and exact downstream `model_asset_id` binding so the prompt model can inspect the same references that will condition H3.
+- Dynamic queue-group/queue-driven sources and processed image chains remain visible as active workflow conditioning but are deliberately not imported as fake stable media when their exact execution pixels are not available yet.
+- Apply-to-Continuum now compares downstream workflow source identity separately from Prompt Writer media visibility/binding, so a correctly bound model-visible copy does not look like graph source drift.
+- Re-materializing the same stable workflow reference after a Prompt Writer session reload may use a new temporary media asset ID without falsely triggering source drift only when the saved stable workflow fingerprint still matches; unfingerprinted bindings stay strict. Model visibility remains part of the contract. Manually replacing an imported copy drops its workflow binding so unrelated pixels cannot continue masquerading as that downstream Picture.
 - Added first-class Image Conveyor compatibility for Continuum conditioning discovery, honoring persistent Reference Shelf population/output switches, Main/Last Frame switches, Queue execution-group size, the legacy node alias, and single-image transform/bypass chains instead of trusting visible wires alone.
 - Added opaque saved source fingerprints for persistent Image Conveyor Reference Shelf images so shelf replacements trigger Continuum source-drift protection without storing filenames; queue-group members remain intentionally dynamic. Legacy saved inventories without fingerprints are accepted once against otherwise identical topology and upgraded to the active fingerprint on successful refinement.
 - Added a pinned Image Conveyor 1.7.2 cross-repository CI contract alongside Prompt Writer's frontend coverage.

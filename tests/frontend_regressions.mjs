@@ -2012,3 +2012,65 @@ test("prompt refinement keeps actions above a vertically resizable editor", () =
   assert.doesNotMatch(mainSource, /refine_height|refineHeight/);
   assert.match(stylesSource, /\.h3ps-refine\[data-refine-panel\] textarea \{[^}]*min-height: 72px;[^}]*resize: vertical;/);
 });
+
+
+test("Continuum Reference UI exposes active workflow image import controls", () => {
+  assert.match(mainSource, /Active workflow images/);
+  assert.match(mainSource, /data-workflow-ref-add-all/);
+  assert.match(mainSource, /Add active workflow refs/);
+  assert.match(mainSource, /fetchComfyImageFile/);
+  assert.match(mainSource, /bindActiveWorkflowReferenceMedia/);
+  assert.match(stylesSource, /\.h3ps-workflow-references/);
+  assert.match(skinSource, /\.h3ps-workflow-references/);
+});
+
+test("Studio state owns transient workflow-reference media bindings", () => {
+  const state = createStudioState({ sessionId: "workflow-bindings", storage: memoryStorage() });
+  assert.deepEqual(state.workflowReferenceBindings, {});
+  assert.equal(state.workflowReferenceImportBusy, false);
+});
+
+
+test("Continuum saved inventory accepts a new temporary Writer asset ID only when model visibility and workflow source stay the same", () => {
+  const saved = {
+    schema_version: 1,
+    items: [{
+      role: "reference_image",
+      kind: "image",
+      source: "workflow",
+      visible_to_model: true,
+      tag: "<Picture 1>",
+      source_node_id: 41,
+      source_node_class: "ImageConveyor",
+      source_output_name: "ref_image_1",
+      source_slot: 6,
+      source_identity: "image-conveyor-ref-v1:1111111111111111",
+      model_asset_id: "old-session-asset",
+    }],
+  };
+  const rematerialized = structuredClone(saved);
+  rematerialized.items[0].model_asset_id = "new-session-asset";
+  assert.equal(sameContinuumReferenceInventory(saved, rematerialized), true);
+
+  const missing = structuredClone(rematerialized);
+  missing.items[0].visible_to_model = false;
+  delete missing.items[0].model_asset_id;
+  assert.equal(sameContinuumReferenceInventory(saved, missing), false);
+
+  const changedSource = structuredClone(rematerialized);
+  changedSource.items[0].source_identity = "image-conveyor-ref-v1:2222222222222222";
+  assert.equal(sameContinuumReferenceInventory(saved, changedSource), false);
+
+  const unfingerprintedSaved = structuredClone(saved);
+  delete unfingerprintedSaved.items[0].source_identity;
+  const unfingerprintedActive = structuredClone(unfingerprintedSaved);
+  unfingerprintedActive.items[0].model_asset_id = "another-session-asset";
+  assert.equal(sameContinuumReferenceInventory(unfingerprintedSaved, unfingerprintedActive), false);
+});
+
+test("manual replacement of an imported workflow copy drops its binding after a successful upload", () => {
+  assert.match(
+    mainSource,
+    /if \(replaceAssetId\) forgetWorkflowReferenceAsset\(replaceAssetId\);/,
+  );
+});

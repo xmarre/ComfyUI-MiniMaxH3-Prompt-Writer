@@ -217,14 +217,32 @@ export function sameContinuumReferenceInventory(savedInventory, activeInventory)
 
   return saved.items.every((savedValue, index) => {
     const activeValue = active.items[index];
-    const savedItem = { ...savedValue, source_identity: null };
-    const activeItem = { ...activeValue, source_identity: null };
+    if (
+      Boolean(savedValue.model_asset_id) !== savedValue.visible_to_model
+      || Boolean(activeValue.model_asset_id) !== activeValue.visible_to_model
+    ) return false;
+
+    const savedSourceIdentity = savedValue.source_identity;
+    const activeSourceIdentity = activeValue.source_identity;
+    const savedModelAssetId = savedValue.model_asset_id;
+    const activeModelAssetId = activeValue.model_asset_id;
+
+    const savedItem = { ...savedValue, source_identity: null, model_asset_id: null };
+    const activeItem = { ...activeValue, source_identity: null, model_asset_id: null };
     if (JSON.stringify(savedItem) !== JSON.stringify(activeItem)) return false;
 
     // Inventories saved before source_identity existed use null as an unknown
     // legacy identity. Once a saved fingerprint exists, it must match strictly.
-    return savedValue.source_identity == null
-      || savedValue.source_identity === activeValue.source_identity;
+    if (savedSourceIdentity != null && savedSourceIdentity !== activeSourceIdentity) return false;
+
+    // model_asset_id is a temporary Writer-session handle. A different ID is
+    // safe only when a stable saved workflow fingerprint proves both copies
+    // came from the same downstream source.
+    if (
+      savedModelAssetId !== activeModelAssetId
+      && (savedSourceIdentity == null || savedSourceIdentity !== activeSourceIdentity)
+    ) return false;
+    return true;
   });
 }
 
@@ -555,6 +573,133 @@ function imageConveyorSourceIdentityDescriptor(graph, connection) {
   };
 }
 
+function safeWorkflowPath(value) {
+  const raw = String(value ?? "").trim().replace(/\\/g, "/");
+  if (!raw || raw.startsWith("/") || /^[a-zA-Z]:/.test(raw)) return "";
+  const parts = raw.split("/").filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "." || part === "..")) return "";
+  return parts.join("/");
+}
+
+function normalizedWorkflowImageFile(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const typeValue = String(value.type ?? "input").trim().toLowerCase();
+  const type = ["input", "output", "temp"].includes(typeValue) ? typeValue : "input";
+  let filename = safeWorkflowPath(value.filename);
+  let subfolder = safeWorkflowPath(value.subfolder);
+  const annotated = String(value.annotated ?? "").trim();
+
+  if (!filename && annotated) {
+    const suffix = annotated.match(/ \[(input|output|temp)\]$/i);
+    const annotatedPath = safeWorkflowPath(suffix ? annotated.slice(0, suffix.index) : annotated);
+    if (annotatedPath) {
+      const parts = annotatedPath.split("/");
+      filename = parts.pop() || "";
+      subfolder = parts.join("/");
+    }
+  } else if (filename && filename.includes("/") && !subfolder) {
+    const parts = filename.split("/");
+    filename = parts.pop() || "";
+    subfolder = parts.join("/");
+  }
+  if (!filename || filename.includes("/")) return null;
+  return { filename, subfolder, type };
+}
+
+function directLoadImageWorkflowMedia(connection) {
+  const source = connection?.source;
+  if (nodeClassId(source) !== "LoadImage") return null;
+  const selected = widget(source, "image")?.value;
+  if (typeof selected !== "string" || !selected.trim()) return null;
+  const file = normalizedWorkflowImageFile({ annotated: selected, type: "input" });
+  if (!file) return null;
+  const stableFile = JSON.stringify([file.filename, file.subfolder, file.type]);
+  return {
+    importable: true,
+    source_kind: "load_image",
+    source_label: "Load Image",
+    source_identity: `load-image-v1:${opaqueStateFingerprint(stableFile)}`,
+    file,
+  };
+}
+
+function imageConveyorWorkflowMedia(graph, connection) {
+  const conveyorOrigin = imageConveyorOriginForConnection(graph, connection);
+  if (!conveyorOrigin) return null;
+  const state = imageConveyorState(conveyorOrigin.source);
+  const mode = imageConveyorOutputMode(state);
+  const outputName = imageConveyorOutputName(conveyorOrigin);
+  const referenceIndex = imageConveyorReferenceOutputIndex(outputName);
+
+  if (mode === IMAGE_CONVEYOR_OUTPUT_MODE_QUEUE_GROUP) {
+    return {
+      importable: false,
+      reason: "dynamic_queue_group",
+      source_kind: "image_conveyor_queue_group",
+      source_label: outputName || "Image Conveyor queue output",
+    };
+  }
+  if (referenceIndex < 0) {
+    return {
+      importable: false,
+      reason: "queue_driven_output",
+      source_kind: "image_conveyor_queue_output",
+      source_label: outputName || "Image Conveyor queue output",
+    };
+  }
+
+  const direct = (
+    conveyorOrigin.source === connection.source
+    && Number(conveyorOrigin.link?.origin_slot) === Number(connection.link?.origin_slot)
+  );
+  if (!direct) {
+    return {
+      importable: false,
+      reason: "processed_image_chain",
+      source_kind: "image_conveyor_processed",
+      source_label: `Image Conveyor Ref ${referenceIndex + 1}`,
+    };
+  }
+
+  const slot = Array.isArray(state.reference_slots) ? state.reference_slots[referenceIndex] : null;
+  const file = normalizedWorkflowImageFile(slot);
+  if (!file) {
+    return {
+      importable: false,
+      reason: "unreadable_reference_file",
+      source_kind: "image_conveyor_persistent",
+      source_label: `Image Conveyor Ref ${referenceIndex + 1}`,
+    };
+  }
+  return {
+    importable: true,
+    source_kind: "image_conveyor_persistent",
+    source_label: `Image Conveyor Ref ${referenceIndex + 1}`,
+    source_identity: imageConveyorSourceIdentityDescriptor(graph, connection).source_identity ?? null,
+    file,
+  };
+}
+
+function workflowImageMediaDescriptor(graph, connection) {
+  const conveyor = imageConveyorWorkflowMedia(graph, connection);
+  if (conveyor) return conveyor;
+  const directLoadImage = directLoadImageWorkflowMedia(connection);
+  if (directLoadImage) return directLoadImage;
+  return {
+    importable: false,
+    reason: "unsupported_runtime_source",
+    source_kind: String(nodeClassId(connection?.source) || "workflow"),
+    source_label: String(nodeClassId(connection?.source) || "Workflow image"),
+  };
+}
+
+function workflowSourceIdentityDescriptor(graph, connection) {
+  const conveyor = imageConveyorSourceIdentityDescriptor(graph, connection);
+  if (conveyor.source_identity) return conveyor;
+  const directLoadImage = directLoadImageWorkflowMedia(connection);
+  return directLoadImage?.source_identity ? { source_identity: directLoadImage.source_identity } : {};
+}
+
 function slotTypesCompatible(inputType, outputType) {
   const liteGraph = globalThis.LiteGraph;
   if (typeof liteGraph?.isValidConnection === "function") {
@@ -640,7 +785,7 @@ export function discoverContinuumReferenceInventory(app, sampler) {
       role: "reference_image",
       input_name: inputName,
       ...sourceDescriptor(connection),
-      ...imageConveyorSourceIdentityDescriptor(graph, connection),
+      ...workflowSourceIdentityDescriptor(graph, connection),
     });
   });
 
@@ -673,11 +818,121 @@ export function discoverContinuumReferenceInventory(app, sampler) {
       role: role.role,
       input_name: inputName,
       ...sourceDescriptor(connection),
-      ...imageConveyorSourceIdentityDescriptor(graph, connection),
+      ...workflowSourceIdentityDescriptor(graph, connection),
     });
   }
 
   return { schema_version: 1, items };
+}
+
+export function continuumReferenceBindingKey(item = {}) {
+  return JSON.stringify([
+    item.role == null ? null : String(item.role),
+    item.input_name == null ? null : String(item.input_name),
+    item.source_node_id == null ? null : String(item.source_node_id),
+    item.source_node_class == null ? null : String(item.source_node_class),
+    item.source_output_name == null ? null : String(item.source_output_name),
+    Number.isInteger(item.source_slot) ? item.source_slot : null,
+  ]);
+}
+
+function workflowImageRoleLabel(item) {
+  if (item?.tag) return String(item.tag);
+  if (item?.role === "first_frame") return "First Frame";
+  if (item?.role === "last_frame") return "Last Frame";
+  return "Workflow image";
+}
+
+export function discoverContinuumWorkflowImageMedia(app, sampler) {
+  const inventory = discoverContinuumReferenceInventory(app, sampler);
+  const graph = app?.graph;
+  const candidates = inventory.items
+    .filter((item) => item?.kind === "image" && ["reference_image", "first_frame", "last_frame"].includes(item?.role))
+    .map((item) => {
+      const connection = sourceForInput(graph, sampler, item.input_name);
+      const media = connection
+        ? workflowImageMediaDescriptor(graph, connection)
+        : { importable: false, reason: "missing_connection", source_kind: "workflow", source_label: "Workflow image" };
+      return {
+        key: continuumReferenceBindingKey(item),
+        label: workflowImageRoleLabel(item),
+        role: item.role,
+        input_name: item.input_name,
+        tag: item.tag ?? null,
+        source_node_id: item.source_node_id,
+        source_node_class: item.source_node_class,
+        source_output_name: item.source_output_name,
+        source_slot: item.source_slot,
+        source_identity: item.source_identity ?? media.source_identity ?? null,
+        ...media,
+      };
+    });
+  return { inventory, candidates };
+}
+
+function bindingValue(bindings, key) {
+  if (bindings instanceof Map) return bindings.get(key) ?? null;
+  if (bindings && typeof bindings === "object") return bindings[key] ?? null;
+  return null;
+}
+
+export function bindContinuumReferenceMedia(inventory, bindings, assets = []) {
+  const assetIds = new Set(
+    (Array.isArray(assets) ? assets : [])
+      .map((asset) => String(asset?.id ?? ""))
+      .filter(Boolean),
+  );
+  const items = (Array.isArray(inventory?.items) ? inventory.items : []).map((item) => {
+    const binding = bindingValue(bindings, continuumReferenceBindingKey(item));
+    const assetId = String(binding?.asset_id ?? "");
+    const sourceIdentity = item?.source_identity == null ? null : String(item.source_identity);
+    const bindingIdentity = binding?.source_identity == null ? null : String(binding.source_identity);
+    const identityMatches = sourceIdentity == null
+      ? bindingIdentity == null
+      : sourceIdentity === bindingIdentity;
+    if (!assetId || !assetIds.has(assetId) || !identityMatches) {
+      const result = { ...item, visible_to_model: false };
+      delete result.model_asset_id;
+      return result;
+    }
+    return {
+      ...item,
+      visible_to_model: true,
+      model_asset_id: assetId,
+    };
+  });
+  return {
+    schema_version: Number(inventory?.schema_version ?? 1),
+    items,
+  };
+}
+
+function workflowInventoryIdentityItem(item = {}) {
+  const identity = inventoryIdentityItem(item);
+  delete identity.visible_to_model;
+  delete identity.model_asset_id;
+  return identity;
+}
+
+export function sameContinuumWorkflowSourceInventory(savedInventory, activeInventory) {
+  const saved = {
+    schema_version: Number(savedInventory?.schema_version ?? 1),
+    items: (Array.isArray(savedInventory?.items) ? savedInventory.items : []).map(workflowInventoryIdentityItem),
+  };
+  const active = {
+    schema_version: Number(activeInventory?.schema_version ?? 1),
+    items: (Array.isArray(activeInventory?.items) ? activeInventory.items : []).map(workflowInventoryIdentityItem),
+  };
+  if (saved.schema_version !== active.schema_version || saved.items.length !== active.items.length) return false;
+  return saved.items.every((savedValue, index) => {
+    const activeValue = active.items[index];
+    const savedSourceIdentity = savedValue.source_identity;
+    const activeSourceIdentity = activeValue.source_identity;
+    const savedItem = { ...savedValue, source_identity: null };
+    const activeItem = { ...activeValue, source_identity: null };
+    if (JSON.stringify(savedItem) !== JSON.stringify(activeItem)) return false;
+    return savedSourceIdentity == null || savedSourceIdentity === activeSourceIdentity;
+  });
 }
 
 
@@ -917,7 +1172,7 @@ export function applySequenceToContinuum(app, sampler, sequenceState, { syncSett
   const inventory = discoverContinuumReferenceInventory(app, sampler);
   if (
     sequenceState?.downstream_reference_inventory
-    && !sameContinuumReferenceInventory(sequenceState.downstream_reference_inventory, inventory)
+    && !sameContinuumWorkflowSourceInventory(sequenceState.downstream_reference_inventory, inventory)
   ) {
     return {
       status: "source_inventory_mismatch",

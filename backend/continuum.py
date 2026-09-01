@@ -201,12 +201,26 @@ def _saved_downstream_inventory_matches(
         active_item = dict(active_item)
         saved_source_identity = saved_item.pop("source_identity", None)
         active_source_identity = active_item.pop("source_identity", None)
+        saved_model_asset_id = saved_item.pop("model_asset_id", None)
+        active_model_asset_id = active_item.pop("model_asset_id", None)
         if saved_item != active_item:
             return False
         # Snapshots created before source_identity existed are accepted once as
         # an unknown legacy identity. A saved fingerprint, however, is strict:
         # the active source must expose the same fingerprint.
         if saved_source_identity is not None and saved_source_identity != active_source_identity:
+            return False
+        # model_asset_id names a temporary Prompt Writer session asset rather
+        # than the downstream source. Permit a new ID only when an existing
+        # stable source fingerprint proves that both copies came from the same
+        # workflow image. Legacy/unfingerprinted visible bindings remain strict.
+        if (
+            saved_model_asset_id != active_model_asset_id
+            and (
+                saved_source_identity is None
+                or saved_source_identity != active_source_identity
+            )
+        ):
             return False
     return True
 

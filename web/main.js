@@ -1,5 +1,5 @@
 import { app } from "/scripts/app.js";
-import { cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, resampleMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
+import { cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, fetchComfyImageFile, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, resampleMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
 import { availableReferenceTags, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
 import {
   applySequenceToContinuum,
@@ -8,9 +8,11 @@ import {
   CONTINUUM_MAX_SECONDS,
   CONTINUUM_MIN_CHUNKS,
   CONTINUUM_MIN_SECONDS,
+  bindContinuumReferenceMedia,
   continuumDraftOutput,
   continuumSamplerLabel,
   discoverContinuumReferenceInventory,
+  discoverContinuumWorkflowImageMedia,
   parseContinuumTimeline,
   sequenceStateFromResult,
   sameContinuumReferenceInventory,
@@ -381,6 +383,194 @@ function icon(name, size = 16) {
   return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true">${paths[name] || paths.info}</svg>`;
 }
 
+function workflowReferenceState() {
+  if (!studio || studio.mode !== "Reference" || studio.generationTarget !== "continuum") {
+    return { status: "hidden", candidates: [], inventory: null };
+  }
+  const choice = chooseContinuumSampler(app);
+  if (choice.status !== "selected") return { status: choice.status, candidates: [], inventory: null };
+  try {
+    const discovered = discoverContinuumWorkflowImageMedia(app, choice.sampler);
+    return { status: "ready", sampler: choice.sampler, ...discovered };
+  } catch (error) {
+    return { status: "error", candidates: [], inventory: null, error };
+  }
+}
+
+function workflowBindingStatus(candidate) {
+  const binding = studio.workflowReferenceBindings?.[candidate.key] || null;
+  const asset = binding
+    ? studio.assets.find((item) => String(item.id) === String(binding.asset_id)) || null
+    : null;
+  if (!binding || !asset) return { binding, asset, state: "missing" };
+  const currentIdentity = candidate.source_identity == null ? null : String(candidate.source_identity);
+  const boundIdentity = binding.source_identity == null ? null : String(binding.source_identity);
+  return {
+    binding,
+    asset,
+    state: currentIdentity === boundIdentity ? "current" : "stale",
+  };
+}
+
+function workflowReferencePreviewUrl(candidate) {
+  if (!candidate?.file) return "";
+  const query = new URLSearchParams({
+    filename: candidate.file.filename,
+    subfolder: candidate.file.subfolder || "",
+    type: candidate.file.type || "input",
+  });
+  return `/view?${query.toString()}`;
+}
+
+function workflowReferenceReason(candidate) {
+  return {
+    dynamic_queue_group: "Dynamic queue-group image; the file is chosen when the workflow is queued.",
+    queue_driven_output: "Queue-driven image; there is no stable file to attach before execution.",
+    processed_image_chain: "This slot passes through an image-processing node; Writer cannot copy the exact runtime pixels before execution.",
+    unreadable_reference_file: "The active Reference Shelf slot has no readable ComfyUI file descriptor.",
+    unsupported_runtime_source: "This active workflow source cannot be materialized into Writer media safely.",
+    missing_connection: "The active workflow image connection could not be resolved.",
+  }[candidate?.reason] || "This workflow image cannot be attached automatically.";
+}
+
+function renderWorkflowReferencePanel() {
+  const state = workflowReferenceState();
+  if (state.status === "hidden") return "";
+  const header = (detail, action = "") => `
+    <section class="h3ps-workflow-references">
+      <header>
+        <span><strong>Active workflow images</strong><small>${detail}</small></span>
+        <span class="h3ps-workflow-reference-actions">${action}<button type="button" class="h3ps-quiet-button" data-workflow-ref-refresh>Refresh</button></span>
+      </header>`;
+
+  if (state.status === "missing") {
+    return `${header("Add H3 Continuum Sampler V3.4 to expose its active image conditioning.")}<p class="h3ps-workflow-reference-empty">No compatible Continuum sampler is present.</p></section>`;
+  }
+  if (state.status === "multiple") {
+    return `${header("Select exactly one H3 Continuum Sampler V3.4 on the canvas.")}<p class="h3ps-workflow-reference-empty">Multiple compatible samplers are present.</p></section>`;
+  }
+  if (state.status === "error") {
+    return `${header("Writer could not resolve the active workflow image state.")}<p class="h3ps-workflow-reference-empty">${escapeHtml(state.error?.message || "Workflow reference discovery failed.")}</p></section>`;
+  }
+
+  const candidates = state.candidates;
+  const actionable = candidates.filter((candidate) => {
+    if (!candidate.importable) return false;
+    return workflowBindingStatus(candidate).state !== "current";
+  });
+  const addAll = candidates.length
+    ? `<button type="button" class="h3ps-secondary-button h3ps-workflow-add-all" data-workflow-ref-add-all ${!actionable.length || studio.workflowReferenceImportBusy ? "disabled" : ""}>${actionable.length ? `Add active workflow refs (${actionable.length})` : "Active refs added"}</button>`
+    : "";
+  const detail = candidates.length
+    ? `${candidates.length} active image conditioning input${candidates.length === 1 ? "" : "s"} on the selected sampler. Add stable images here so the prompt model can actually inspect them.`
+    : "The selected sampler currently has no active image conditioning inputs.";
+
+  const rows = candidates.map((candidate, index) => {
+    const binding = workflowBindingStatus(candidate);
+    const preview = candidate.importable ? workflowReferencePreviewUrl(candidate) : "";
+    const status = binding.state === "current"
+      ? "Writer can see"
+      : binding.state === "stale"
+        ? "Update needed"
+        : candidate.importable
+          ? "Workflow only"
+          : candidate.reason === "dynamic_queue_group" || candidate.reason === "queue_driven_output"
+            ? "Dynamic at execution"
+            : "Exact pixels unavailable";
+    const action = candidate.importable
+      ? `<button type="button" data-workflow-ref-add="${index}" ${studio.workflowReferenceImportBusy || binding.state === "current" ? "disabled" : ""}>${binding.state === "current" ? "Added" : binding.state === "stale" ? "Update" : "Add"}</button>`
+      : `<button type="button" disabled title="${escapeHtml(workflowReferenceReason(candidate))}">Unavailable</button>`;
+    const detailText = candidate.source_label
+      ? `${candidate.input_name} · ${candidate.source_label}`
+      : candidate.input_name;
+    return `
+      <div class="h3ps-workflow-reference-row ${binding.state === "current" ? "is-bound" : binding.state === "stale" ? "is-stale" : ""}">
+        <span class="h3ps-workflow-reference-thumb">${preview ? `<img src="${escapeHtml(preview)}" alt="">` : icon("image", 16)}</span>
+        <span class="h3ps-workflow-reference-copy"><strong>${escapeHtml(candidate.label)}</strong><small>${escapeHtml(detailText)}</small></span>
+        <em title="${candidate.importable ? "" : escapeHtml(workflowReferenceReason(candidate))}">${status}</em>
+        ${action}
+      </div>`;
+  }).join("");
+
+  return `${header(detail, addAll)}<div class="h3ps-workflow-reference-list">${rows || '<p class="h3ps-workflow-reference-empty">No active workflow image slots.</p>'}</div></section>`;
+}
+
+function forgetWorkflowReferenceAsset(assetId) {
+  for (const [key, binding] of Object.entries(studio.workflowReferenceBindings || {})) {
+    if (String(binding?.asset_id ?? "") === String(assetId ?? "")) delete studio.workflowReferenceBindings[key];
+  }
+}
+
+async function importWorkflowReferenceCandidates(candidates) {
+  if (studio.workflowReferenceImportBusy || !Array.isArray(candidates) || !candidates.length) return;
+  const actionable = candidates.filter((candidate) => {
+    if (!candidate?.importable || !candidate.file) return false;
+    return workflowBindingStatus(candidate).state !== "current";
+  });
+  if (!actionable.length) {
+    showToast("Workflow references are current", "All importable active workflow images are already visible to the prompt model.");
+    return;
+  }
+
+  const referenceImages = studio.assets.filter((asset) => asset.mode === "Reference" && asset.type === "image").length;
+  const additions = actionable.filter((candidate) => !workflowBindingStatus(candidate).asset).length;
+  if (referenceImages + additions > 9) {
+    showToast(
+      "Reference image limit reached",
+      `Adding these workflow references would require ${referenceImages + additions} images, but Reference mode accepts at most 9. Remove unused analysis images first.`,
+    );
+    return;
+  }
+
+  studio.workflowReferenceImportBusy = true;
+  renderMedia(studio.mode);
+  let imported = 0;
+  try {
+    for (const candidate of actionable) {
+      const before = workflowBindingStatus(candidate);
+      const file = await fetchComfyImageFile(candidate.file, candidate.file.filename);
+      const replaceAssetId = before.asset?.id || null;
+      const result = await uploadMedia(studio.sessionId, "Reference", [file], replaceAssetId);
+      let assetId = replaceAssetId;
+      if (replaceAssetId) {
+        studio.assets = result.assets;
+      } else {
+        const added = result.assets?.[0];
+        if (!added?.id) throw new Error("Writer did not return the imported workflow image asset.");
+        studio.assets = [...studio.assets, ...result.assets];
+        assetId = added.id;
+      }
+      studio.workflowReferenceBindings[candidate.key] = {
+        asset_id: assetId,
+        source_identity: candidate.source_identity ?? null,
+        label: candidate.label,
+        input_name: candidate.input_name,
+      };
+      imported += 1;
+    }
+    showToast(
+      "Workflow references added",
+      `${imported} active workflow image${imported === 1 ? "" : "s"} ${imported === 1 ? "is" : "are"} now visible to the prompt model and bound to the matching downstream conditioning slot${imported === 1 ? "" : "s"}.`,
+      null,
+      null,
+      { durationMs: 5200 },
+    );
+  } catch (error) {
+    showToast(error.code || "Workflow reference import failed", error.message, error.details);
+  } finally {
+    studio.workflowReferenceImportBusy = false;
+    renderMedia(studio.mode);
+  }
+}
+
+function bindActiveWorkflowReferenceMedia(inventory) {
+  return bindContinuumReferenceMedia(
+    inventory,
+    studio.workflowReferenceBindings,
+    studio.assets,
+  );
+}
+
 function renderAsset(asset, index) {
   const destructiveDisabled = studio.requestBusy ? "disabled" : "";
   const draggable = studio.requestBusy ? "false" : "true";
@@ -433,6 +623,7 @@ function renderMedia(mode) {
     const filter = isReference ? studio.mediaFilter : "all";
     const visibleAssets = filter === "all" ? assets : assets.filter((asset) => asset.type === filter);
     const counts = assets.reduce((result, asset) => ({ ...result, [asset.type]: (result[asset.type] || 0) + 1 }), {});
+    const workflowReferences = isReference ? renderWorkflowReferencePanel() : "";
     const filters = isReference ? `
       <div class="h3ps-media-filters" aria-label="Reference type">
         <button type="button" data-media-filter="all" class="${filter === "all" ? "is-active" : ""}">All <b>${assets.length}/12</b></button>
@@ -443,6 +634,7 @@ function renderMedia(mode) {
     const addLabel = !isReference || filter === "image" ? "Add image" : filter === "video" ? "Add video" : filter === "audio" ? "Add audio" : "Add media";
     const canAdd = isReference || assets.length < data.limit;
     media.innerHTML = `
+      ${workflowReferences}
       ${filters}
       <div class="h3ps-assets ${isReference ? "is-reference" : ""}">${visibleAssets.map((asset) => renderAsset(asset, assets.indexOf(asset))).join("")}
         ${canAdd ? `<button class="${assets.length ? "h3ps-add-asset" : "h3ps-empty-drop"}" type="button" data-add-media ${studio.requestBusy ? "disabled" : ""}>${icon("plus", 18)}<span>${addLabel}</span><small>Drop files here</small></button>` : ""}
@@ -490,6 +682,15 @@ function referenceTagKind(reference) {
 
 function referenceTagsForCurrentDraft() {
   if (!studio || studio.mode !== "Reference") return [];
+  if (studio.generationTarget === "continuum") {
+    const workflow = workflowReferenceState();
+    if (workflow.status === "ready") {
+      return workflow.inventory.items
+        .map((item) => item?.tag)
+        .filter(Boolean)
+        .map(String);
+    }
+  }
   return availableReferenceTags(studio.assets, studio.root.querySelector("[data-output]").value);
 }
 
@@ -548,6 +749,24 @@ function insertSelectedReference(reference) {
 
 function bindMediaActions(mode) {
   const media = studio.root.querySelector("[data-h3ps-media]");
+  studio.root.querySelectorAll("[data-workflow-ref-refresh]").forEach((button) => {
+    button.addEventListener("click", () => renderMedia(mode));
+  });
+  studio.root.querySelectorAll("[data-workflow-ref-add-all]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const current = workflowReferenceState();
+      if (current.status === "ready") void importWorkflowReferenceCandidates(current.candidates);
+    });
+  });
+  studio.root.querySelectorAll("[data-workflow-ref-add]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const current = workflowReferenceState();
+      const candidate = current.status === "ready"
+        ? current.candidates[Number(button.dataset.workflowRefAdd)]
+        : null;
+      if (candidate) void importWorkflowReferenceCandidates([candidate]);
+    });
+  });
   studio.root.querySelectorAll("[data-media-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       studio.mediaFilter = button.dataset.mediaFilter;
@@ -572,8 +791,10 @@ function bindMediaActions(mode) {
     button.addEventListener("click", async (event) => {
       event.stopPropagation();
       try {
-        const result = await removeMedia(studio.sessionId, button.dataset.removeAsset);
+        const removedAssetId = button.dataset.removeAsset;
+        const result = await removeMedia(studio.sessionId, removedAssetId);
         studio.assets = result.assets;
+        forgetWorkflowReferenceAsset(removedAssetId);
         renderMedia(mode);
       } catch (error) {
         showToast(error.code || "Remove failed", error.message, error.details);
@@ -688,6 +909,10 @@ async function uploadFiles(mode, files, replaceAssetId = null) {
     const result = await uploadMedia(studio.sessionId, mode, files, replaceAssetId);
     studio.sessionId = result.session_id;
     studio.assets = replaceAssetId ? result.assets : [...studio.assets, ...result.assets];
+    // A manual Replace changes the Prompt Writer copy independently of its
+    // workflow source. Drop any workflow binding only after replacement
+    // succeeds; the Active workflow images panel will then offer Add again.
+    if (replaceAssetId) forgetWorkflowReferenceAsset(replaceAssetId);
     renderMedia(mode);
     hideToast();
     if (audioWasAdded(previousAssets, studio.assets)) {
@@ -1008,6 +1233,7 @@ function setGenerationTarget(target) {
   studio.lastModelMeta = promptLengthMeta(output.value);
   studio.root.querySelector(".h3ps-editor-meta span:last-child").textContent = studio.lastModelMeta;
   syncGenerationTarget();
+  renderMedia(studio.mode);
   renderPromptHighlights();
   syncModifiedState();
   saveCurrentModeDraft();
@@ -1483,7 +1709,9 @@ async function startGenerationPreview() {
       studio.activeRequestModelId = null;
       return;
     }
-    downstreamReferenceInventory = discoverContinuumReferenceInventory(app, target.sampler);
+    downstreamReferenceInventory = bindActiveWorkflowReferenceMedia(
+      discoverContinuumReferenceInventory(app, target.sampler),
+    );
     const modeTopology = validateContinuumModeTopology(studio.mode, downstreamReferenceInventory);
     if (!modeTopology.valid) {
       const required = modeTopology.required;
@@ -2919,7 +3147,9 @@ async function submitRefinement() {
       );
       return;
     }
-    downstreamReferenceInventory = discoverContinuumReferenceInventory(app, target.sampler);
+    downstreamReferenceInventory = bindActiveWorkflowReferenceMedia(
+      discoverContinuumReferenceInventory(app, target.sampler),
+    );
     if (
       studio.continuumSequence?.downstream_reference_inventory
       && !sameContinuumReferenceInventory(
@@ -3327,6 +3557,7 @@ function createStudio() {
     try {
       const result = await clearMedia(studio.sessionId, studio.mode);
       studio.assets = result.assets;
+      if (studio.mode === "Reference") studio.workflowReferenceBindings = {};
       closeVideoPreview();
       renderMedia(studio.mode);
       showToast("Media cleared", "The temporary session files were removed.");
