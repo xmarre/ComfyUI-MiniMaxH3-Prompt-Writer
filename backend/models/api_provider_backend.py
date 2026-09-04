@@ -802,6 +802,12 @@ class ApiProviderBackend:
         with self._connection_lock:
             self._connection = http_connection
         content_parts: list[str] = []
+        structured_reasoning_parts: list[str] = []
+        structured_output_request = (
+            connection.compatibility_profile == "lm_studio"
+            and isinstance(payload.get("response_format"), dict)
+            and payload["response_format"].get("type") == "json_schema"
+        )
         finish_reason: str | None = None
         usage: dict[str, Any] = {}
         usage_source = "missing"
@@ -884,6 +890,16 @@ class ApiProviderBackend:
                     for part in text:
                         if isinstance(part, dict) and isinstance(part.get("text"), str):
                             content_parts.append(part["text"])
+                if structured_output_request:
+                    # LM Studio currently has Qwen reasoning-model cases where the JSON-schema
+                    # grammar is applied to the separated reasoning stream and content stays empty.
+                    # Capture that provider field only for constrained planner requests; promote it
+                    # below only when it is itself complete JSON.
+                    reasoning_text = delta.get("reasoning_content")
+                    if not isinstance(reasoning_text, str):
+                        reasoning_text = delta.get("reasoning")
+                    if isinstance(reasoning_text, str):
+                        structured_reasoning_parts.append(reasoning_text)
                 if choice.get("finish_reason") is not None:
                     finish_reason = str(choice["finish_reason"])
         except ModelError:
@@ -902,6 +918,14 @@ class ApiProviderBackend:
                     self._connection = None
             http_connection.close()
         content = "".join(content_parts)
+        if structured_output_request and not content.strip() and structured_reasoning_parts:
+            reasoning_candidate = "".join(structured_reasoning_parts).strip()
+            try:
+                json.loads(reasoning_candidate)
+            except json.JSONDecodeError:
+                pass
+            else:
+                content = reasoning_candidate
         if not usage:
             usage = {"prompt_tokens": 0, "completion_tokens": estimate_text_tokens(content)}
             usage_source = "estimated" if content else "missing"

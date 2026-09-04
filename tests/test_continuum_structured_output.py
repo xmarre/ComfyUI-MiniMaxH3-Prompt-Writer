@@ -206,6 +206,114 @@ class ContinuumStructuredOutputTests(unittest.TestCase):
         self.assertNotIn("properties", serialized)
         self.assertIn("structured-request", serialized)
 
+    def test_lm_studio_structured_planner_promotes_valid_json_from_reasoning_stream(self) -> None:
+        response_format = _lm_studio_continuum_response_format(self.connection(), _assembled("plan"))
+
+        class Response:
+            status = 200
+
+            @staticmethod
+            def getheaders():
+                return []
+
+            def __init__(self, reasoning_field: str, *, content: str = "") -> None:
+                self.lines = iter([
+                    ("data: " + json.dumps({
+                        "choices": [{
+                            "delta": {
+                                reasoning_field: '{"schema_version":2}',
+                                "content": content,
+                            },
+                            "finish_reason": "stop",
+                        }]
+                    }) + "\n").encode("utf-8"),
+                    b"data: [DONE]\n",
+                ])
+
+            def readline(self):
+                return next(self.lines, b"")
+
+        class HttpConnection:
+            def __init__(self, response):
+                self.response = response
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return self.response
+
+            def close(self):
+                return None
+
+        for reasoning_field in ("reasoning_content", "reasoning"):
+            with self.subTest(reasoning_field=reasoning_field):
+                http = HttpConnection(Response(reasoning_field))
+                payload = {
+                    "model": "qwen-model",
+                    "messages": [],
+                    "stream": True,
+                    "response_format": response_format,
+                }
+                with patch.object(self.backend, "_http_connection", return_value=http):
+                    result = self.backend._request_chat_completion_stream(self.connection(), payload)
+                self.assertEqual(result["choices"][0]["message"]["content"], '{"schema_version":2}')
+
+    def test_lm_studio_reasoning_fallback_is_scoped_and_never_overrides_content(self) -> None:
+        response_format = _lm_studio_continuum_response_format(self.connection(), _assembled("plan"))
+
+        class Response:
+            status = 200
+
+            @staticmethod
+            def getheaders():
+                return []
+
+            def __init__(self, *, content: str, reasoning: str) -> None:
+                self.lines = iter([
+                    ("data: " + json.dumps({
+                        "choices": [{
+                            "delta": {"content": content, "reasoning_content": reasoning},
+                            "finish_reason": "stop",
+                        }]
+                    }) + "\n").encode("utf-8"),
+                    b"data: [DONE]\n",
+                ])
+
+            def readline(self):
+                return next(self.lines, b"")
+
+        class HttpConnection:
+            def __init__(self, response):
+                self.response = response
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return self.response
+
+            def close(self):
+                return None
+
+        cases = [
+            (self.connection(), "plain-content", '{"schema_version":2}', response_format, "plain-content"),
+            (self.connection(), "", "reasoning prose", response_format, ""),
+            (self.connection(profile="generic"), "", '{"schema_version":2}', response_format, ""),
+        ]
+        for connection, content, reasoning, fmt, expected in cases:
+            with self.subTest(profile=connection.compatibility_profile, content=content, reasoning=reasoning):
+                http = HttpConnection(Response(content=content, reasoning=reasoning))
+                payload = {
+                    "model": "qwen-model",
+                    "messages": [],
+                    "stream": True,
+                    "response_format": fmt,
+                }
+                with patch.object(self.backend, "_http_connection", return_value=http):
+                    result = self.backend._request_chat_completion_stream(connection, payload)
+                self.assertEqual(result["choices"][0]["message"]["content"], expected)
+
     def test_handler_sends_schema_and_disables_lm_studio_reasoning_for_constrained_planner(self) -> None:
         connection = self.connection()
         response_format = _lm_studio_continuum_response_format(connection, _assembled("plan"))

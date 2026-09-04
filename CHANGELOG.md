@@ -14,7 +14,7 @@
 
 ### Reliability
 
-- Constrained LM Studio H3 Continuum `plan` and `plan_repair` responses with JSON Schema structured output while retaining Prompt Writer semantic validation, deterministic recovery, and the single bounded repair limit; constrained Qwen planner stages run without reasoning to avoid LM Studio routing schema output into reasoning-only content, and terminal planner failures now include content-free structural response diagnostics.
+- Constrained LM Studio H3 Continuum `plan` and `plan_repair` responses with JSON Schema structured output while retaining Prompt Writer semantic validation, deterministic recovery, and the single bounded repair limit; constrained planner stages use non-thinking application semantics, and the LM Studio adapter safely recovers valid schema JSON from the separated reasoning stream when affected Qwen runtimes leave `content` empty. Terminal planner failures now include content-free structural response diagnostics.
 - Aligned Continuum compatibility with current upstream V3.4–V3.7 samplers, including the V3.5+ Reference Audio `<Audio 1>` contract and native 4–30-second chunk range while retaining 5–15 seconds as the recommended range.
 
 - Hardened H3 Continuum sequence-plan recovery after schema drift: the one bounded repair pass now retains the complete original planner contract instead of replacing it with a weaker repair-only system prompt, explicitly rechecks non-empty shared preamble and numeric stable-subject IDs, and canonicalizes reserved model aliases such as `<Subject A>` → `<Subject 1>` consistently across the plan before validation.
