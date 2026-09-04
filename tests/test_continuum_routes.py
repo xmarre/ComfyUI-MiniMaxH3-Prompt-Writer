@@ -241,6 +241,29 @@ class ContinuumRouteTests(unittest.IsolatedAsyncioTestCase):
             [False, False, False, True],
         )
 
+    async def test_double_non_json_plan_failure_reports_content_free_structural_metadata(self):
+        initial = "<think>private initial planner text with no JSON"
+        repair = "repair prose with one opening brace { but no complete object"
+        response, stage, _backend = await self.run_sequence([
+            {"prompt": initial, "primary_finish_reason": "stop"},
+            {"prompt": repair, "primary_finish_reason": "stop"},
+        ])
+        self.assertEqual(response.status, 502)
+        error = self.payload(response)["error"]
+        self.assertEqual(error["code"], "INVALID_CONTINUUM_PLAN")
+        self.assertEqual(stage.await_count, 2)
+        details = error["details"]
+        self.assertEqual(details["initial_response"]["chars"], len(initial))
+        self.assertEqual(details["initial_response"]["finish_reason"], "stop")
+        self.assertTrue(details["initial_response"]["starts_with_think"])
+        self.assertFalse(details["initial_response"]["contains_object_open"])
+        self.assertEqual(details["repair_response"]["chars"], len(repair))
+        self.assertTrue(details["repair_response"]["contains_object_open"])
+        self.assertFalse(details["repair_response"]["contains_object_close"])
+        serialized = json.dumps(details)
+        self.assertNotIn("private initial planner text", serialized)
+        self.assertNotIn("repair prose", serialized)
+
     async def test_non_json_initial_then_empty_preamble_repair_recovers_without_third_model_call(self):
         repaired = _plan()
         repaired["global"]["sequence_preamble"] = ""

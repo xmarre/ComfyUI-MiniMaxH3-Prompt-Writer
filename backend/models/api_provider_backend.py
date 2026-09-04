@@ -159,18 +159,32 @@ class ApiConnection:
     connection_verified: bool = False
 
 
+def _uses_lm_studio_continuum_structured_output(
+    *,
+    preset: str,
+    compatibility_profile: str,
+    assembled: dict[str, Any],
+) -> bool:
+    request_input = assembled.get("input", {})
+    return (
+        preset == "custom"
+        and compatibility_profile == "lm_studio"
+        and request_input.get("generation_target") == "continuum"
+        and request_input.get("continuum_stage") in {"plan", "plan_repair"}
+    )
+
+
 def _lm_studio_continuum_response_format(
     connection: ApiConnection,
     assembled: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if connection.preset != "custom" or connection.compatibility_profile != "lm_studio":
-        return None
-    request_input = assembled.get("input", {})
-    if (
-        request_input.get("generation_target") != "continuum"
-        or request_input.get("continuum_stage") not in {"plan", "plan_repair"}
+    if not _uses_lm_studio_continuum_structured_output(
+        preset=connection.preset,
+        compatibility_profile=connection.compatibility_profile,
+        assembled=assembled,
     ):
         return None
+    request_input = assembled.get("input", {})
     settings = request_input.get("continuum")
     if not isinstance(settings, dict):
         raise ModelError(
@@ -527,6 +541,7 @@ class ApiProviderBackend:
             "externally_managed": True,
             "api_connection_id": connection.id,
             "api_preset": connection.preset,
+            "api_compatibility_profile": connection.compatibility_profile,
             "endpoint": connection.base_url,
             "remote_model": model_id,
             "source_label": f"{PRESETS[connection.preset]['name']} · API provider",
@@ -713,7 +728,13 @@ class ApiProviderBackend:
                 "API_RUNTIME_MANAGED",
                 "Context and KV cache are managed by the API provider. Set both options to Auto.",
             )
-        if thinking and model_info.get("thinking") is not True:
+        structured_planner = _uses_lm_studio_continuum_structured_output(
+            preset=str(model_info.get("api_preset") or ""),
+            compatibility_profile=str(model_info.get("api_compatibility_profile") or "generic"),
+            assembled=assembled,
+        )
+        effective_thinking = False if structured_planner else thinking
+        if effective_thinking and model_info.get("thinking") is not True:
             raise ModelError("API_THINKING_UNAVAILABLE", "This provider model does not report reasoning controls.")
         visual_input_count = sum(
             1 for item in assembled.get("media_inputs", []) if item.get("type") in {"image", "video"}
@@ -731,12 +752,12 @@ class ApiProviderBackend:
             estimated_input_tokens + THINKING_OUTPUT_TOKENS + CONTEXT_SAFETY_TOKENS,
         )
         standard_output_tokens = non_thinking_output_tokens(assembled)
-        desired_output = THINKING_OUTPUT_TOKENS if thinking else standard_output_tokens
+        desired_output = THINKING_OUTPUT_TOKENS if effective_thinking else standard_output_tokens
         provider_max_output = model_info.get("max_output_tokens")
         if isinstance(provider_max_output, int) and provider_max_output > 0:
             desired_output = min(desired_output, provider_max_output)
         available_output = context_tokens - estimated_input_tokens - CONTEXT_SAFETY_TOKENS
-        minimum_output = MINIMUM_OUTPUT_TOKENS if thinking else desired_output
+        minimum_output = MINIMUM_OUTPUT_TOKENS if effective_thinking else desired_output
         if available_output < minimum_output:
             raise ModelError(
                 "CONTEXT_BUDGET_EXCEEDED",
@@ -754,13 +775,13 @@ class ApiProviderBackend:
             "context_tokens": context_tokens,
             "requested_kv_cache": "auto",
             "kv_cache": "provider",
-            "thinking": thinking,
+            "thinking": effective_thinking,
             "estimated_text_tokens": estimated_text_tokens,
             "estimated_input_tokens": estimated_input_tokens,
             "visual_input_count": visual_input_count,
             "max_output_tokens": max_output_tokens,
             "reserved_output_tokens": max_output_tokens + CONTEXT_SAFETY_TOKENS,
-            "thinking_budget_reduced": thinking and max_output_tokens < THINKING_OUTPUT_TOKENS,
+            "thinking_budget_reduced": effective_thinking and max_output_tokens < THINKING_OUTPUT_TOKENS,
             "context_limit_known": known_context is not None,
         }
 

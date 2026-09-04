@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from backend.continuum import ContinuumError, parse_sequence_plan
 from backend.continuum_schema import continuum_plan_json_schema, planner_response_metadata
+from backend.models.contract import ModelError
 from backend.models.api_provider_backend import (
     ApiConnection,
     ApiProviderBackend,
@@ -111,6 +112,99 @@ class ContinuumStructuredOutputTests(unittest.TestCase):
                 _assembled("plan"),
             )
         )
+
+    def test_lm_studio_planner_preflight_uses_non_thinking_8192_budget(self) -> None:
+        model = self.backend._model_info(self.connection(), "qwen-model")
+        plan = self.backend.preflight(
+            model,
+            _assembled("plan"),
+            context_profile="auto",
+            kv_cache="auto",
+            thinking=True,
+        )
+        self.assertFalse(plan["thinking"])
+        self.assertEqual(plan["context_tokens"], 15360)
+        self.assertEqual(plan["max_output_tokens"], 8192)
+
+        repair = self.backend.preflight(
+            model,
+            _assembled("plan_repair"),
+            context_profile="auto",
+            kv_cache="auto",
+            thinking=True,
+        )
+        self.assertFalse(repair["thinking"])
+        self.assertEqual(repair["max_output_tokens"], 8192)
+
+    def test_non_planner_lm_studio_and_generic_planner_keep_thinking_validation(self) -> None:
+        lm_studio_model = self.backend._model_info(self.connection(), "qwen-model")
+        with self.assertRaises(ModelError) as normal:
+            self.backend.preflight(
+                lm_studio_model,
+                {"input": {"generation_target": "single"}, "messages": [], "media_inputs": []},
+                context_profile="auto",
+                kv_cache="auto",
+                thinking=True,
+            )
+        self.assertEqual(normal.exception.code, "API_THINKING_UNAVAILABLE")
+
+        generic_model = self.backend._model_info(self.connection(profile="generic"), "qwen-model")
+        with self.assertRaises(ModelError) as generic:
+            self.backend.preflight(
+                generic_model,
+                _assembled("plan"),
+                context_profile="auto",
+                kv_cache="auto",
+                thinking=True,
+            )
+        self.assertEqual(generic.exception.code, "API_THINKING_UNAVAILABLE")
+
+    def test_lm_studio_structured_output_rejection_is_distinct_and_content_free(self) -> None:
+        class Response:
+            status = 400
+
+            @staticmethod
+            def getheaders():
+                return [("X-Request-ID", "structured-request")]
+
+            @staticmethod
+            def read():
+                return json.dumps({
+                    "error": {
+                        "message": "unsupported response_format",
+                        "type": "invalid_request_error",
+                    }
+                }).encode("utf-8")
+
+        class HttpConnection:
+            def request(self, *_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def getresponse():
+                return Response()
+
+            @staticmethod
+            def close():
+                return None
+
+        response_format = _lm_studio_continuum_response_format(self.connection(), _assembled("plan"))
+        payload = {
+            "model": "qwen-model",
+            "messages": [{"role": "user", "content": "private creative brief"}],
+            "stream": True,
+            "response_format": response_format,
+        }
+        with (
+            patch.object(self.backend, "_http_connection", return_value=HttpConnection()),
+            self.assertRaises(ModelError) as raised,
+        ):
+            self.backend._request_chat_completion_stream(self.connection(), payload)
+        self.assertEqual(raised.exception.code, "API_STRUCTURED_OUTPUT_REJECTED")
+        serialized = json.dumps(raised.exception.details)
+        self.assertNotIn("private creative brief", serialized)
+        self.assertNotIn("properties", serialized)
+        self.assertIn("structured-request", serialized)
 
     def test_handler_sends_schema_and_disables_lm_studio_reasoning_for_constrained_planner(self) -> None:
         connection = self.connection()
