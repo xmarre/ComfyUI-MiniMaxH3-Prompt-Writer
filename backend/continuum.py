@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from .assembly import assemble_refinement, assemble_request
+from .continuum_schema import CONTINUUM_PLAN_SCHEMA_VERSION, continuum_plan_json_schema
 from .references import (
     effective_reference_tags,
     missing_reference_declarations,
@@ -18,7 +19,7 @@ from .references import (
 
 GENERATION_TARGET_SINGLE = "single"
 GENERATION_TARGET_CONTINUUM = "continuum"
-CONTINUUM_SCHEMA_VERSION = 2
+CONTINUUM_SCHEMA_VERSION = CONTINUUM_PLAN_SCHEMA_VERSION
 LEGACY_CONTINUUM_SCHEMA_VERSION = 1
 MIN_CHUNKS = 1
 MAX_CHUNKS = 16
@@ -491,36 +492,8 @@ def validate_sequence_reference_scope(
 
 
 def _planner_schema(settings: dict[str, Any]) -> str:
-    chunk_template = [
-        {
-            "continuity": "initial" if index == 1 else "continuous",
-            "transition": "",
-            "start_state": "compact state at the start of this chunk",
-            "action": "events that happen during this chunk",
-            "end_state": "compact state reached at the end of this chunk",
-        }
-        for index in range(1, settings["chunks"] + 1)
-    ]
     return json.dumps(
-        {
-            "schema_version": CONTINUUM_SCHEMA_VERSION,
-            "global": {
-                "sequence_preamble": (
-                    "Polished MiniMax H3 prompt prose containing only sequence-wide identity, persistent reference roles, "
-                    "wardrobe/prop/environment/style continuity, genuinely global camera/lighting/audio rules, exclusions, "
-                    "and other constraints intended to apply to every chunk."
-                ),
-                "continuity_anchors": "compact internal continuity facts used while planning",
-                "persistent_constraints": "compact internal constraints that apply across the sequence",
-                "subject_anchors": [
-                    {
-                        "id": "<Subject 1>",
-                        "meaning": "stable identity and role of this subject across chunks",
-                    }
-                ],
-            },
-            "chunks": chunk_template,
-        },
+        continuum_plan_json_schema(settings),
         ensure_ascii=False,
         indent=2,
     )
@@ -595,7 +568,7 @@ def assemble_continuum_plan_request(body: dict[str, Any]) -> dict[str, Any]:
         f"Creative brief:\n{base['input']['creative_brief']}\n\n"
         "Return exactly the semantic schema below. Do not add chunk index/time fields or reference_assignments; "
         "Prompt Writer owns those deterministic values.\n\n"
-        f"Schema:\n{_planner_schema(settings)}"
+        f"JSON Schema:\n{_planner_schema(settings)}"
     )
     return {
         "schema_version": 1,

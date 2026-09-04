@@ -33,6 +33,7 @@ from .continuum import (
     validate_continuum_settings,
     validate_generated_chunk,
 )
+from .continuum_schema import planner_response_metadata
 from .devlog import DEVELOPER_MODE, LOG_PATH, PeakVRAMMonitor, gpu_memory_snapshot, write_event
 from .guides import MODE_GUIDES, guide_catalog, guide_for_mode
 from .media import (
@@ -511,6 +512,7 @@ def _model_error_status(error: ModelError) -> int:
         "API_REQUEST_TIMEOUT",
         "API_RESPONSE_INVALID",
         "API_GENERATION_FAILED",
+        "API_STRUCTURED_OUTPUT_REJECTED",
         "INVALID_CONTINUUM_PLAN",
         "INVALID_CONTINUUM_PLAN_CHUNKS",
         "INVALID_CONTINUUM_PLAN_CONTINUITY",
@@ -791,6 +793,8 @@ async def _generate_continuum(
                                     "message": recovery_error.message,
                                     "details": recovery_error.details,
                                 },
+                                "initial_response": planner_response_metadata(planner_result),
+                                "repair_response": planner_response_metadata(repair_result),
                             },
                         ) from recovery_error
 

@@ -19,6 +19,7 @@ from ..context import (
     estimate_text_tokens,
     non_thinking_output_tokens,
 )
+from ..continuum_schema import continuum_plan_json_schema
 from ..h3_pipeline import run_h3_pipeline, validate_media_capabilities
 from ..version import VERSION
 from .contract import ModelError
@@ -158,6 +159,41 @@ class ApiConnection:
     connection_verified: bool = False
 
 
+def _lm_studio_continuum_response_format(
+    connection: ApiConnection,
+    assembled: dict[str, Any],
+) -> dict[str, Any] | None:
+    if connection.preset != "custom" or connection.compatibility_profile != "lm_studio":
+        return None
+    request_input = assembled.get("input", {})
+    if (
+        request_input.get("generation_target") != "continuum"
+        or request_input.get("continuum_stage") not in {"plan", "plan_repair"}
+    ):
+        return None
+    settings = request_input.get("continuum")
+    if not isinstance(settings, dict):
+        raise ModelError(
+            "INVALID_CONTINUUM_SETTINGS",
+            "Continuum planner structured output requires validated Continuum settings.",
+        )
+    try:
+        schema = continuum_plan_json_schema(settings)
+    except ValueError as error:
+        raise ModelError(
+            "INVALID_CONTINUUM_SETTINGS",
+            "Continuum planner structured output requires a valid chunk count.",
+        ) from error
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "h3_continuum_plan_v2",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
 class _ApiChatHandler:
     def __init__(self, backend: "ApiProviderBackend", connection: ApiConnection, model_id: str) -> None:
         self.backend = backend
@@ -174,6 +210,7 @@ class _ApiChatHandler:
         max_tokens: int,
         seed: int | None,
         thinking: bool,
+        response_format: dict[str, Any] | None = None,
         **_unused: Any,
     ) -> dict[str, Any]:
         del top_k, seed
@@ -182,6 +219,8 @@ class _ApiChatHandler:
             "messages": messages,
             "stream": True,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         preset = self.connection.preset
         if preset in {"openai", "gemini", "openrouter"}:
             payload["stream_options"] = {"include_usage": True}
@@ -207,7 +246,9 @@ class _ApiChatHandler:
         elif thinking and preset == "openrouter":
             payload["reasoning"] = {"enabled": True, "exclude": True}
         elif preset == "custom" and self.connection.compatibility_profile == "lm_studio":
-            payload["reasoning_effort"] = "low" if thinking else "none"
+            # LM Studio/Qwen reasoning can route constrained JSON into reasoning_content.
+            # Structured Continuum planning therefore runs as an explicit non-thinking request.
+            payload["reasoning_effort"] = "none" if response_format is not None else ("low" if thinking else "none")
         return self.backend._request_chat_completion_stream(self.connection, payload)
 
 
@@ -760,7 +801,22 @@ class ApiProviderBackend:
                     data = json.loads(raw.decode("utf-8")) if raw else {}
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     data = {}
-                raise self._http_error(connection.preset, response.status, data, response_headers)
+                provider_error = self._http_error(connection.preset, response.status, data, response_headers)
+                response_format = payload.get("response_format")
+                if (
+                    connection.compatibility_profile == "lm_studio"
+                    and isinstance(response_format, dict)
+                    and response_format.get("type") == "json_schema"
+                    and provider_error.code == "API_INVALID_REQUEST"
+                ):
+                    details = dict(provider_error.details or {})
+                    details["structured_output"] = "json_schema"
+                    raise ModelError(
+                        "API_STRUCTURED_OUTPUT_REJECTED",
+                        "LM Studio rejected the Continuum planner structured-output request.",
+                        details,
+                    ) from provider_error
+                raise provider_error
             while True:
                 if self.cancel_event.is_set():
                     raise ModelError("GENERATION_CANCELLED", "Generation was cancelled.")
@@ -867,9 +923,12 @@ class ApiProviderBackend:
                 if on_phase:
                     on_phase("loading_model")
                 handler = _ApiChatHandler(self, connection, model_info["remote_model"])
+                response_format = _lm_studio_continuum_response_format(connection, assembled)
+                structured_planner = response_format is not None
 
                 def complete(**kwargs: Any) -> dict[str, Any]:
                     kwargs.pop("purpose", None)
+                    kwargs["response_format"] = response_format
                     return handler(**kwargs)
 
                 result = run_h3_pipeline(
@@ -880,7 +939,7 @@ class ApiProviderBackend:
                     complete=complete,
                     count_text_tokens=lambda text: estimate_text_tokens(text) + 1,
                     is_cancelled=self.cancel_event.is_set,
-                    thinking=thinking,
+                    thinking=False if structured_planner else thinking,
                     seed=seed,
                     on_phase=on_phase,
                 )
